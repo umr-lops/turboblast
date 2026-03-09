@@ -1,13 +1,15 @@
 import argparse
 import subprocess
+from pathlib import Path
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from turboblast.blaster import main, parser_args, process_line
 
-
 # ─── process_line ────────────────────────────────────────────────────────────
+
 
 class TestProcessLine:
     def test_success(self):
@@ -16,7 +18,14 @@ class TestProcessLine:
             process_line("/path/to/script.sh", "--input a.nc --output /tmp")
             mock_run.assert_called_once()
             cmd = mock_run.call_args[0][0]
-            assert cmd == ["bash", "/path/to/script.sh", "--input", "a.nc", "--output", "/tmp"]
+            assert cmd == [
+                "bash",
+                "/path/to/script.sh",
+                "--input",
+                "a.nc",
+                "--output",
+                "/tmp",
+            ]
 
     def test_passes_env_with_pythonunbuffered(self):
         with patch("turboblast.blaster.subprocess.run") as mock_run:
@@ -48,20 +57,23 @@ class TestProcessLine:
 
 # ─── parser_args ─────────────────────────────────────────────────────────────
 
+
 class TestParserArgs:
-    BASE_ARGS = [
-        "--listing-input", "/data/inputs.txt",
-        "--bash-slurm-exec", "/scripts/run.sh",
+    BASE_ARGS: ClassVar[list[str]] = [
+        "--listing-input",
+        "/data/inputs.txt",
+        "--bash-slurm-exec",
+        "/scripts/run.sh",
     ]
 
     def test_required_args(self):
-        with patch("sys.argv", ["blaster"] + self.BASE_ARGS):
+        with patch("sys.argv", ["blaster", *self.BASE_ARGS]):
             args = parser_args()
             assert args.listing_input == "/data/inputs.txt"
             assert args.bash_slurm_exec == "/scripts/run.sh"
 
     def test_defaults(self):
-        with patch("sys.argv", ["blaster"] + self.BASE_ARGS):
+        with patch("sys.argv", ["blaster", *self.BASE_ARGS]):
             args = parser_args()
             assert args.num_tasks == 20
             assert args.timeout_min == 20
@@ -72,29 +84,41 @@ class TestParserArgs:
             assert args.output_dir == "submitit_logs_array"
 
     def test_custom_values(self):
-        with patch("sys.argv", ["blaster"] + self.BASE_ARGS + [
-            "--timeout-min", "60",
-            "--mem-gb", "8",
-            "--slurm-partition", "gpu",
-        ]):
+        with patch(
+            "sys.argv",
+            [
+                "blaster",
+                *self.BASE_ARGS,
+                "--timeout-min",
+                "60",
+                "--mem-gb",
+                "8",
+                "--slurm-partition",
+                "gpu",
+            ],
+        ):
             args = parser_args()
             assert args.timeout_min == 60
             assert args.mem_gb == 8
             assert args.slurm_partition == "gpu"
 
     def test_missing_required_args_exits(self):
-        with patch("sys.argv", ["blaster"]):
-            with pytest.raises(SystemExit):
-                parser_args()
+        with patch("sys.argv", ["blaster"]), pytest.raises(SystemExit):
+            parser_args()
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────
 
+
 class TestMain:
-    def _make_args(self, tmp_path, lines=None):
+    def _make_args(
+        self, tmp_path: Path, lines: list[str] | None = None
+    ) -> argparse.Namespace:
         input_file = tmp_path / "inputs.txt"
-        content = "\n".join(lines) if lines is not None else "--input a.nc\n--input b.nc"
-        input_file.write_text(content)
+        content = (
+            "\n".join(lines) if lines is not None else "--input a.nc\n--input b.nc"
+        )
+        input_file.write_text(content, encoding="utf-8")
         return argparse.Namespace(
             listing_input=str(input_file),
             bash_slurm_exec="/scripts/run.sh",
@@ -113,7 +137,9 @@ class TestMain:
         mock_job.job_id = "12345"
         mock_executor.map_array.return_value = [mock_job, mock_job]
 
-        with patch("turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor):
+        with patch(
+            "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
+        ):
             main(args)
             mock_executor.map_array.assert_called_once()
 
@@ -121,7 +147,9 @@ class TestMain:
         args = self._make_args(tmp_path, lines=[])
         mock_executor = MagicMock()
 
-        with patch("turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor):
+        with patch(
+            "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
+        ):
             main(args)
             mock_executor.map_array.assert_not_called()
 
@@ -133,18 +161,24 @@ class TestMain:
         mock_job.job_id = "99"
         mock_executor.map_array.return_value = [mock_job]
 
-        with patch("turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor):
+        with patch(
+            "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
+        ):
             main(args)
             assert mock_executor.map_array.call_count == 3  # 1000 + 1000 + 500
 
     def test_blank_lines_ignored(self, tmp_path):
-        args = self._make_args(tmp_path, lines=["--input a.nc", "", "  ", "--input b.nc"])
+        args = self._make_args(
+            tmp_path, lines=["--input a.nc", "", "  ", "--input b.nc"]
+        )
         mock_executor = MagicMock()
         mock_job = MagicMock()
         mock_job.job_id = "1"
         mock_executor.map_array.return_value = [mock_job, mock_job]
 
-        with patch("turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor):
+        with patch(
+            "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
+        ):
             main(args)
             submitted = mock_executor.map_array.call_args[0][1]
             assert len(submitted) == 2
