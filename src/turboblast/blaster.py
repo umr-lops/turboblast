@@ -170,7 +170,7 @@ def main(args: argparse.Namespace) -> None:
 
     # Read inputs
     # Use Path object method to correctly open the file (fixes mypy overload error)
-    with Path(args.listing_input).open("r") as f:
+    with Path(args.listing_input).open("r", encoding="utf-8") as f:
         array_inputs = [line.strip() for line in f if line.strip()]
 
     if not array_inputs:
