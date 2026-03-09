@@ -11,7 +11,7 @@ from pathlib import Path
 
 import submitit  # type: ignore[import-not-found]
 
-from turboblast.logo import logo
+from turboblast.logo import LOGO
 
 # Configure the logger globally
 # This format matches standard logging practices: [Date Time] [LEVEL] Message
@@ -91,7 +91,7 @@ def parser_args() -> argparse.Namespace:
     # formatter_class=argparse.RawDescriptionHelpFormatter is REQUIRED
     # to preserve the newlines and spaces of the ASCII art logo!
     parser = argparse.ArgumentParser(
-        description=logo, formatter_class=argparse.RawDescriptionHelpFormatter
+        description=LOGO, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
         "--num-tasks",
