@@ -47,7 +47,7 @@ while true; do
             FIRST_LINE=$(echo "$RAW_DATA" | head -n 1)
             NAME=$(echo "$FIRST_LINE" | awk '{print $3}' | cut -c1-12)
             MEM=$(echo "$FIRST_LINE" | awk '{print $4}')
-            
+
             # Format Start Time to be shorter (HH:MM:SS or Month-Day HH:MM)
             # Slurm usually returns YYYY-MM-DDTHH:MM:SS
             START_RAW=$(echo "$FIRST_LINE" | awk '{print $5}')
@@ -64,7 +64,7 @@ while true; do
             C=$(echo "$RAW_DATA" | grep -c "COMPLETING")
             OK=$(echo "$RAW_DATA" | grep -c "COMPLETED")
             FAIL=$(echo "$RAW_DATA" | grep -c -E "FAILED|TIMEOUT|CANCELLED|NODE_FAIL")
-            
+
             # Calculations
             TOTAL=$(echo "$RAW_DATA" | wc -l)
             FINISHED=$((OK + FAIL))
