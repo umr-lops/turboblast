@@ -1,56 +1,98 @@
+#!/usr/bin/python
 import argparse
 import datetime
 import functools
+import logging
 import os
+import shlex
 import subprocess
 import sys
+from pathlib import Path
 
-import submitit
+import submitit  # type: ignore[import-not-found]
+
+from turboblast.logo import logo
+
+# Configure the logger globally
+# This format matches standard logging practices: [Date Time] [LEVEL] Message
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+logger = logging.getLogger(__name__)
 
 
-def process_line(slurmexe, options_one_line):
+def process_line(slurmexe: str, options_one_line: str) -> None:
+    """Executes a single task in the Slurm job array by calling a bash script.
+
+    This function is serialized and executed on the Slurm compute node by submitit.
+    It constructs the command, sets up the environment, and streams both standard
+    output and standard error directly to the submitit log files.
+
+    Args:
+        slurmexe (str): The path to the bash executable/script to run.
+        options_one_line (str): A string containing the command-line arguments
+            to pass to the bash script (e.g., "--input file.txt --output dir/").
+
+    Raises:
+        subprocess.CalledProcessError: If the bash command exits with a non-zero
+            status code, ensuring submitit and Slurm mark the task as FAILED.
     """
-    Function executed by each task in the job array.
-    """
-    print(f"[Task options: {options_one_line}] Starting computation", flush=True)
+    logger.info("Starting computation for options: %s", options_one_line)
 
     # Construct the command
-    # We use shlex.split if options are complex, but for simple strings list structure is better
-    # However, since shell=False is safer, we construct the command list
-    cmd = ["bash", slurmexe] + options_one_line.split()
+    # shlex.split is safer than string.split() if your options contain quoted strings
+    # RUF005: Use unpacking instead of list concatenation
+    cmd = ["bash", slurmexe, *shlex.split(options_one_line)]
 
-    print(f"Executing: {' '.join(cmd)}", flush=True)
+    logger.info("Executing command: %s", " ".join(cmd))
 
-    # We use subprocess.call or run WITHOUT capture_output.
-    # This allows logs to stream directly to the submitit log files in real-time.
     # 1. Prepare the environment correctly
-    # Copy the current environment (including PATH, LD_LIBRARY_PATH, etc.)
     full_env = os.environ.copy()
-    # Add your specific variable
     full_env["PYTHONUNBUFFERED"] = "1"
+
     try:
-        # check=True will raise a CalledProcessError if return code != 0
-        # subprocess.run(cmd, shell=False, check=True, env=env)
         subprocess.run(
             cmd,
             shell=False,
             check=True,
             stdout=sys.stdout,
-            stderr=sys.stderr,
+            # Redirect stderr to stdout to merge logs chronologically.
+            # This ensures INFO and WARNING/ERROR messages don't get out of sync.
+            stderr=subprocess.STDOUT,
             env=full_env,
         )
-        sys.stdout.flush()  # Force a flush after the process finishes
-        print(
-            f"Task with options {options_one_line} completed successfully.", flush=True
-        )
+        # Flush to ensure everything is written to the submitit .out file immediately
+        sys.stdout.flush()
+        logger.info("Task completed successfully for options: %s", options_one_line)
+
     except subprocess.CalledProcessError as e:
-        print(f"Error in task with options: {options_one_line}", file=sys.stderr)
-        print(f"Command returned exit status {e.returncode}", file=sys.stderr)
-        raise e  # Re-raise exception so submitit marks the job as FAILED
+        # TRY400: Use logging.exception instead of logging.error inside except block
+        logger.exception(
+            "Task failed for options: %s (exit status %s)",
+            options_one_line,
+            e.returncode,
+        )
+        # TRY201: Use bare raise
+        raise
 
 
-def parser_args():
-    parser = argparse.ArgumentParser(description="Submitit array job example")
+def parser_args() -> argparse.Namespace:
+    """Parses command-line arguments for the submitit client.
+
+    Returns:
+        argparse.Namespace: An object containing all the parsed command-line
+            arguments and their values.
+    """
+
+    # formatter_class=argparse.RawDescriptionHelpFormatter is REQUIRED
+    # to preserve the newlines and spaces of the ASCII art logo!
+    parser = argparse.ArgumentParser(
+        description=logo, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--num-tasks",
         type=int,
@@ -81,7 +123,7 @@ def parser_args():
     )
     parser.add_argument(
         "--output-dir",
-        help="Directory to store submitit logs (suffixed with out/YYYYMMDDTHHMMSS/)",
+        help="Directory to store submitit logs",
         default="submitit_logs_array",
     )
     parser.add_argument(
@@ -90,15 +132,31 @@ def parser_args():
     return parser.parse_args()
 
 
-def main(args):
+def main(args: argparse.Namespace) -> None:
+    """Configures and submits the job arrays to the Slurm cluster.
+
+    This function reads the input file, configures the submitit AutoExecutor
+    with the required Slurm parameters (memory, partition, time, etc.), and
+    submits the jobs in chunks to respect Slurm array limits.
+
+    Args:
+        args (argparse.Namespace): The parsed command-line arguments containing
+            paths and Slurm configuration variables.
+    """
     # Create log directory
-    output_dir_with_date = os.path.join(
-        args.output_dir, datetime.datetime.today().strftime("%Y%m%dT%H%M%S")
-    )
-    os.makedirs(output_dir_with_date, exist_ok=True)
+    # DTZ002: Use datetime.now with a timezone instead of today()
+    output_dir_with_date = Path(args.output_dir) / datetime.datetime.now(
+        datetime.timezone.utc
+    ).strftime("%Y%m%dT%H%M%S")
+
+    # Use instance method for directory creation
+    output_dir_with_date.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Submitit logs will be stored in: %s", output_dir_with_date)
+    logger.info("Bash script to execute: %s", args.bash_slurm_exec)
 
     executor = submitit.AutoExecutor(folder=output_dir_with_date, cluster="slurm")
-    print("args.bash_slurm_exec", args.bash_slurm_exec)
+
     # Slurm Configuration
     executor.update_parameters(
         timeout_min=args.timeout_min,
@@ -106,75 +164,76 @@ def main(args):
         cpus_per_task=args.cpus_per_task,
         slurm_partition=args.slurm_partition,
         slurm_array_parallelism=args.slurm_array_parallelism,
-        # Naming the job makes it easier to find in squeue
-        slurm_job_name=os.path.basename(args.bash_slurm_exec).replace(".sh", ""),
+        slurm_job_name=Path(args.bash_slurm_exec).name.replace(".sh", ""),
         slurm_additional_parameters={"export": "ALL,PYTHONUNBUFFERED=1"},
     )
 
     # Read inputs
-    with open(args.listing_input) as f:
-        # Filter out empty lines just in case
+    # Use Path object method to correctly open the file (fixes mypy overload error)
+    with Path(args.listing_input).open("r") as f:
         array_inputs = [line.strip() for line in f if line.strip()]
 
     if not array_inputs:
-        print("Error: Input listing file is empty.")
+        logger.error("Input listing file is empty. Aborting submission.")
         return
 
-    print(f"Submitting {len(array_inputs)} tasks...")
-
-    # if an image must be pulled from registry, honestly it is much easier with a .sif on fs.
-    # reason why the block below is commented out.
-    # Pull the image on the submission node first
-    # img_url = "oras://registry.hpc.ifremer.fr/lops-siam-sentinel1-workbench/unifiedwvalticolocs:2026.2.17"
-    # img_sif = "unifiedwvalticolocs_2026.2.17.sif"
-
-    # if not os.path.exists(img_sif):
-    #     print(f"Pulling image {img_url}...")
-    #     subprocess.run(["apptainer", "pull", img_sif, img_url], check=True)
-
-    # KEY CHANGE: Use partial to bind the bash script path to the function
-    # The map_array will only vary the second argument (options_one_line)
-
-    # Define the chunk size (set this slightly below your MaxArraySize, e.g., 500 or 1000)
-    chunk_size = 1000  # Adjust based on your cluster's MaxArraySize and the total number of tasks, here I am not sure this is the limit but it failed with 1379 lines
+    # Define the chunk size (e.g., 1000)
+    chunk_size = 1000
     all_jobs = []
 
-    print(f"Total tasks to submit: {len(array_inputs)}")
+    logger.info("Total tasks to submit: %d", len(array_inputs))
+
+    # Calculate total number of chunks for logging
+    total_chunks = (len(array_inputs) + chunk_size - 1) // chunk_size
+    logger.info(
+        "Submitting tasks in chunks of %d (Total chunks: %d)...",
+        chunk_size,
+        total_chunks,
+    )
+
+    process_func = functools.partial(process_line, args.bash_slurm_exec)
 
     # Loop through the inputs in chunks
-    chuncked_inputs = range(0, len(array_inputs), chunk_size)
-    print(f"Submitting tasks in chunks of {chunk_size}...")
-    print(f"Total chunks to submit: {len(list(chuncked_inputs))}")
-    for i in chuncked_inputs:
+    for chunk_idx, i in enumerate(range(0, len(array_inputs), chunk_size), start=1):
         chunk = array_inputs[i : i + chunk_size]
-        print(f"Submitting chunk starting at index {i} (size: {len(chunk)})...")
+        logger.info(
+            "Submitting chunk %d/%d (size: %d, starting at index %d)...",
+            chunk_idx,
+            total_chunks,
+            len(chunk),
+            i,
+        )
 
-        # This will create a NEW Slurm Job ID for every 1000 tasks
-        process_func = functools.partial(process_line, args.bash_slurm_exec)
+        # This will create a NEW Slurm Job Array for every 1000 tasks
         jobs = executor.map_array(process_func, chunk)
 
-        print(f"Submitted. Job ID for this chunk: {jobs[0].job_id}")
+        logger.info(
+            "Chunk %d submitted successfully. Job Array ID: %s",
+            chunk_idx,
+            jobs[0].job_id,
+        )
         all_jobs.extend(jobs)
 
-    print(
-        f"Successfully submitted all {len(all_jobs)} tasks across multiple Job Arrays."
+    logger.info(
+        "Successfully submitted all %d tasks across %d Job Arrays.",
+        len(all_jobs),
+        total_chunks,
     )
 
-    # process_func = functools.partial(process_line, args.bash_slurm_exec)
-
-    # # Submit the array
-    # jobs = executor.map_array(process_func, array_inputs)
-
-    # Get the ID of the array job
-    # jobs[0] gives access to the whole array group usually, or iterate to see IDs
-    print(f"Job Array submitted. Main Job ID: {jobs[0].job_id}")
-    print(f"Logs are being written to: {output_dir_with_date}")
-    print(
-        f"You can monitor specific logs using: tail -f {output_dir_with_date}/<JOB_ID>_<TASK_ID>_0.out"
-    )
+    if all_jobs:
+        logger.info("First Job Array Main Job ID: %s", all_jobs[0].job_id)
+        logger.info(
+            "To monitor specific task logs, use: tail -f %s/<JOB_ID>_<TASK_ID>_0.out",
+            output_dir_with_date,
+        )
 
 
-def entrypoint():
+def entrypoint() -> None:
+    """Script entrypoint.
+
+    Calls the argument parser and passes the resulting arguments to the
+    main execution function.
+    """
     args = parser_args()
     main(args)
 
