@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import time
+import subprocess
 import submitit  # type: ignore[import-not-found]
 
 from turboblast.logo import LOGO
@@ -23,6 +25,37 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+
+# À mettre en constante en haut du fichier
+MAX_JOBS_IN_QUEUE = 5000   # seuil conservateur, à adapter
+QUEUE_POLL_INTERVAL = 60   # secondes entre chaque vérification
+
+
+def count_user_jobs() -> int:
+    """Retourne le nombre de jobs (pending + running) de l'utilisateur."""
+    result = subprocess.run(
+        ["squeue", "-u", os.environ["USER"], "-h", "--states=PD,R"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return len(result.stdout.strip().splitlines())
+
+
+def wait_for_queue_space(max_jobs: int, poll_interval: int) -> None:
+    """Bloque jusqu'à ce qu'il y ait de la place dans la queue."""
+    while True:
+        current = count_user_jobs()
+        if current < max_jobs:
+            return
+        logger.info(
+            "Queue saturée (%d jobs en cours), attente %ds...",
+            current,
+            poll_interval,
+        )
+        time.sleep(poll_interval)
 
 
 def process_line(slurmexe: str, options_one_line: str) -> None:
@@ -195,6 +228,9 @@ def main(args: argparse.Namespace) -> None:
 
     # Loop through the inputs in chunks
     for chunk_idx, i in enumerate(range(0, len(array_inputs), chunk_size), start=1):
+        # Attendre de la place avant chaque soumission
+        wait_for_queue_space(MAX_JOBS_IN_QUEUE, QUEUE_POLL_INTERVAL)
+
         chunk = array_inputs[i : i + chunk_size]
         logger.info(
             "Submitting chunk %d/%d (size: %d, starting at index %d)...",
@@ -204,16 +240,13 @@ def main(args: argparse.Namespace) -> None:
             i,
         )
 
-        # This will create a NEW Slurm Job Array for every 1000 tasks
         jobs = executor.map_array(process_func, chunk)
-
         logger.info(
-            "Chunk %d submitted successfully. Job Array ID: %s",
+            "Chunk %d submitted. Job Array ID: %s",
             chunk_idx,
             jobs[0].job_id,
         )
         all_jobs.extend(jobs)
-
     logger.info(
         "Successfully submitted all %d tasks across %d Job Arrays.",
         len(all_jobs),
