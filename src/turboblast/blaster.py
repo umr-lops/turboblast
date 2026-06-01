@@ -217,7 +217,7 @@ def submit_chunk_with_retry(
             )
             return jobs
 
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, TypeError) as exc:
             # Catch all exceptions during submission to enable retry logic.
             # Transient failures (network, Slurm congestion, etc.) can raise
             # various exception types. We preserve the last exception to
