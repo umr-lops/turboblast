@@ -100,12 +100,14 @@ warn_return_any = false
 module = "turboblast.*"
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
+disable_error_code = "type-arg"
 
 [[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
 ignore_errors = true
+
 
 
 

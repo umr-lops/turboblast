@@ -573,7 +573,7 @@ def main(args: argparse.Namespace) -> None:
         "Submitting in chunks of %d (%d chunks total)...", CHUNK_SIZE, total_chunks
     )
 
-    process_func = functools.partial(process_line, args.bash_slurm_exec)  # type: ignore[type-arg]
+    process_func = functools.partial(process_line, args.bash_slurm_exec)
 
     global_completed = 0
     global_failed = 0
