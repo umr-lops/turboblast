@@ -46,6 +46,7 @@ Changelog = "https://github.com/umr-lops/turboblast/releases"
 test = [
   "pytest >=9",
   "pytest-cov >=7",
+  "pytest-timeout >=2",
   "ruff >=0.9.0",
 ]
 dev = [

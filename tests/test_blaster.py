@@ -2,7 +2,7 @@ import argparse
 import subprocess
 from pathlib import Path
 from typing import ClassVar
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -12,6 +12,7 @@ from turboblast.blaster import (
     parser_args,
     process_line,
     submit_chunk_with_retry,
+    wait_for_batch_completion,
 )
 
 # ─── process_line ────────────────────────────────────────────────────────────
@@ -53,7 +54,6 @@ class TestProcessLine:
             assert mock_run.call_args[1]["shell"] is False
 
     def test_options_with_quoted_strings(self):
-        """shlex.split should correctly handle quoted arguments."""
         with patch("turboblast.blaster.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
             process_line("/script.sh", '--input "file with spaces.nc"')
@@ -76,7 +76,7 @@ class TestParseMemoryToGb:
             ("512M", 0.5),
             ("512MB", 0.5),
             ("100M", 100 / 1024),
-            ("2", 2.0),  # bare int → gigabytes (backward compat)
+            ("2", 2.0),
         ],
     )
     def test_valid_values(self, value, expected):
@@ -118,7 +118,7 @@ class TestParserArgs:
             args = parser_args()
             assert args.num_tasks == 20
             assert args.timeout_min == 20
-            assert args.mem == "2G"  # new: string, not int
+            assert args.mem == "2G"
             assert args.cpus_per_task == 1
             assert args.slurm_partition == "cpu"
             assert args.slurm_array_parallelism == 20
@@ -192,27 +192,110 @@ class TestSubmitChunkWithRetry:
         executor = MagicMock()
         mock_job = MagicMock()
         mock_job.job_id = "99"
-        # Fail on first attempt, succeed on second attempt (max retries = 2)
         executor.map_array.side_effect = [
             RuntimeError("sbatch failed"),
-            [mock_job],  # succeed on second attempt
+            [mock_job],
         ]
         with patch("turboblast.blaster.time.sleep"):
             jobs = submit_chunk_with_retry(executor, MagicMock(), ["a"], 1, 1)
         assert jobs == [mock_job]
-        assert executor.map_array.call_count == 2  # 1 failure + 1 success = 2 calls
+        assert executor.map_array.call_count == 2
 
     def test_raises_after_max_retries(self):
         executor = MagicMock()
-        # Fail all attempts (max retries = 2, so 2 failures)
         executor.map_array.side_effect = RuntimeError("sbatch always fails")
         with (
             patch("turboblast.blaster.time.sleep"),
             pytest.raises(RuntimeError, match="submission failed after 2 attempts"),
         ):
             submit_chunk_with_retry(executor, MagicMock(), ["a"], 1, 1)
-        # SUBMIT_MAX_RETRIES = 2, so 2 attempts total
         assert executor.map_array.call_count == 2
+
+
+# ─── wait_for_batch_completion ───────────────────────────────────────────────
+
+
+class TestWaitForBatchCompletion:
+    def test_all_jobs_complete_successfully(self):
+        jobs = []
+        for _i in range(3):
+            job = MagicMock()
+            # Simuler la propriété state avec des valeurs changeantes
+            state_mock = PropertyMock(side_effect=["RUNNING", "RUNNING", "COMPLETED"])
+            type(job).state = state_mock
+            jobs.append(job)
+
+        with (
+            patch("turboblast.blaster.time.sleep") as _,
+            patch("turboblast.blaster.tqdm"),
+            patch("turboblast.blaster.BATCH_POLL_INTERVAL", 0.001),
+        ):
+            completed, failed = wait_for_batch_completion(jobs, 1, 1, 0)
+            assert completed == 3
+            assert failed == 0
+
+    def test_some_jobs_fail(self):
+        jobs = []
+        job1 = MagicMock()
+        type(job1).state = PropertyMock(side_effect=["RUNNING", "COMPLETED"])
+        job2 = MagicMock()
+        type(job2).state = PropertyMock(side_effect=["RUNNING", "FAILED"])
+        jobs = [job1, job2]
+
+        with (
+            patch("turboblast.blaster.time.sleep"),
+            patch("turboblast.blaster.tqdm"),
+            patch("turboblast.blaster.BATCH_POLL_INTERVAL", 0.001),
+        ):
+            completed, failed = wait_for_batch_completion(jobs, 1, 1, 0)
+            assert completed == 1
+            assert failed == 1
+
+    def test_stall_timeout_triggers_cancellation(self):
+        jobs = []
+        for i in range(2):
+            job = MagicMock()
+            type(job).state = PropertyMock(return_value="RUNNING")
+            job.job_id = f"1234{i}"
+            jobs.append(job)
+
+        # Simuler l'écoulement du temps : après quelques appels, dépasser le timeout
+        time_values = [0.0, 0.1, 0.2, 0.3, 0.4, 120.0] * 10  # assez de valeurs
+        mock_monotonic = MagicMock(side_effect=time_values)
+
+        with (
+            patch("turboblast.blaster.time.sleep") as _,
+            patch("turboblast.blaster.BATCH_POLL_INTERVAL", 0.001),
+            patch("turboblast.blaster.tqdm"),
+            patch("turboblast.blaster.subprocess.run") as mock_run,
+            patch("time.monotonic", mock_monotonic),
+        ):
+            completed, failed = wait_for_batch_completion(
+                jobs, 1, 1, stall_timeout_min=1
+            )
+            assert mock_run.call_count == 2
+            mock_run.assert_any_call(["scancel", "12340"], check=False)
+            mock_run.assert_any_call(["scancel", "12341"], check=False)
+            assert completed == 0
+            assert failed == 2
+
+    def test_exception_during_state_fetch(self):
+        """When job.state raises an exception, treat as UNKNOWN and retry."""
+        job = MagicMock()
+        # Une exception au premier appel, puis COMPLETED
+        state_mock = PropertyMock(side_effect=[RuntimeError("error"), "COMPLETED"])
+        type(job).state = state_mock
+        jobs = [job]
+
+        # Réduire l'intervalle de poll pour éviter les délais
+        with (
+            patch("turboblast.blaster.time.sleep"),
+            patch("turboblast.blaster.BATCH_POLL_INTERVAL", 0.001),
+            patch("turboblast.blaster.tqdm"),
+        ):
+            completed, failed = wait_for_batch_completion(jobs, 1, 1, 0)
+            assert completed == 1
+            assert failed == 0
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────
@@ -232,12 +315,12 @@ class TestMain:
             bash_slurm_exec="/scripts/run.sh",
             output_dir=str(tmp_path / "logs"),
             timeout_min=20,
-            mem="2G",  # new: string
+            mem="2G",
             cpus_per_task=1,
             slurm_partition="cpu",
             slurm_array_parallelism=20,
-            fail_fast=False,  # new
-            batch_stall_timeout_min=0,  # new
+            fail_fast=False,
+            batch_stall_timeout_min=0,
         )
 
     def test_submits_jobs(self, tmp_path):
@@ -251,23 +334,16 @@ class TestMain:
             patch(
                 "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
             ),
-            # Mock wait_for_batch_completion to avoid blocking on real Slurm.
-            patch(
-                "turboblast.blaster.wait_for_batch_completion",
-                return_value=(2, 0),
-            ),
+            patch("turboblast.blaster.wait_for_batch_completion", return_value=(2, 0)),
         ):
             main(args)
-            # Vérifier que map_array a été appelé avec les bons arguments
             call_args = mock_executor.map_array.call_args
             assert call_args is not None
-            # Le deuxième argument devrait être la liste des inputs
             assert len(call_args[0][1]) == 2
 
     def test_empty_input_file_aborts(self, tmp_path):
         args = self._make_args(tmp_path, lines=[])
         mock_executor = MagicMock()
-
         with patch(
             "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
         ):
@@ -275,7 +351,6 @@ class TestMain:
             mock_executor.map_array.assert_not_called()
 
     def test_chunks_large_input(self, tmp_path):
-        """Input > 1000 lines should produce multiple map_array calls."""
         args = self._make_args(tmp_path, lines=[f"--input {i}.nc" for i in range(2500)])
         mock_executor = MagicMock()
         mock_job = MagicMock()
@@ -287,12 +362,10 @@ class TestMain:
                 "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
             ),
             patch(
-                "turboblast.blaster.wait_for_batch_completion",
-                return_value=(1000, 0),
+                "turboblast.blaster.wait_for_batch_completion", return_value=(1000, 0)
             ),
         ):
             main(args)
-            # Vérifier que map_array a été appelé 3 fois (1000 + 1000 + 500)
             assert mock_executor.map_array.call_count == 3
 
     def test_blank_lines_ignored(self, tmp_path):
@@ -308,18 +381,13 @@ class TestMain:
             patch(
                 "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
             ),
-            patch(
-                "turboblast.blaster.wait_for_batch_completion",
-                return_value=(2, 0),
-            ),
+            patch("turboblast.blaster.wait_for_batch_completion", return_value=(2, 0)),
         ):
             main(args)
-            # Vérifier que seulement 2 inputs ont été soumis (les lignes vides ignorées)
             submitted = mock_executor.map_array.call_args[0][1]
             assert len(submitted) == 2
 
     def test_fail_fast_stops_after_first_failure(self, tmp_path):
-        """With fail_fast=True and a failing batch, only 1 chunk should be submitted."""
         args = self._make_args(tmp_path, lines=[f"--input {i}.nc" for i in range(2500)])
         args.fail_fast = True
         mock_executor = MagicMock()
@@ -331,13 +399,53 @@ class TestMain:
             patch(
                 "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
             ),
-            # First batch has failures (900 completed, 100 failed)
             patch(
-                "turboblast.blaster.wait_for_batch_completion",
-                return_value=(900, 100),
+                "turboblast.blaster.wait_for_batch_completion", return_value=(900, 100)
             ),
         ):
             main(args)
-            # fail_fast → stopped after first batch, not 3
-            # Note: Le premier batch contient 1000 tâches (CHUNK_SIZE=1000)
             assert mock_executor.map_array.call_count == 1
+
+    def test_fail_fast_false_continues_after_failures(self, tmp_path):
+        """With fail_fast=False, continue to next batches even if failures occur."""
+        args = self._make_args(tmp_path, lines=[f"--input {i}.nc" for i in range(2500)])
+        args.fail_fast = False
+        mock_executor = MagicMock()
+        mock_job = MagicMock()
+        mock_job.job_id = "99"
+        mock_executor.map_array.return_value = [mock_job]
+
+        # Trois chunks → trois résultats
+        side_effects = [
+            (900, 100),
+            (1000, 0),
+            (1000, 0),
+        ]  # premier échoue, les autres réussissent
+        with (
+            patch(
+                "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
+            ),
+            patch(
+                "turboblast.blaster.wait_for_batch_completion",
+                side_effect=side_effects,
+            ),
+        ):
+            main(args)
+            # fail_fast=False → tous les chunks sont soumis
+            assert mock_executor.map_array.call_count == 3
+
+    def test_output_dir_creation_with_timestamp(self, tmp_path):
+        args = self._make_args(tmp_path)
+        mock_executor = MagicMock()
+        mock_executor.map_array.return_value = [MagicMock(), MagicMock()]
+        with (
+            patch(
+                "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
+            ),
+            patch("turboblast.blaster.wait_for_batch_completion", return_value=(2, 0)),
+        ):
+            main(args)
+            output_dir = Path(args.output_dir)
+            subdirs = list(output_dir.glob("*"))
+            assert len(subdirs) == 1
+            assert subdirs[0].name.startswith("20")
