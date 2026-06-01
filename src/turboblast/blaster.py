@@ -310,7 +310,7 @@ def wait_for_batch_completion(
                     # Ces exceptions sont attendues dans le contexte submitit/Slurm
                     logger.debug("Job state query failed: %s: %s", type(e).__name__, e)
                     state = "UNKNOWN"
-                except Exception as e:
+                except (KeyboardInterrupt, SystemExit, OSError) as e:
                     # Attraper les autres exceptions mais avec log de warning
                     # et propagation des exceptions système critiques
                     if isinstance(e, (KeyboardInterrupt, SystemExit)):
