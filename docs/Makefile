@@ -20,7 +20,7 @@ help:
 # line removed from Makefile below
 #pip install -r ../requirements_doc.txt
 %: Makefile
-	
+
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 # add github action
 github:
