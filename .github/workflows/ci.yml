@@ -34,12 +34,6 @@ jobs:
       - uses: pre-commit/action@v3.0.1
         with:
           extra_args: --hook-stage manual --all-files
-      # - name: Run Pylint
-      # run: uvx nox -s pylint -- --output-format=github
-      - name: Run ruff
-        run: |
-          ruff check src/
-          ruff format --check src/
 
   checks:
     name: Check Python ${{ matrix.python-version }} on ${{ matrix.runs-on }}
