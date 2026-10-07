@@ -495,7 +495,11 @@ def parser_args() -> argparse.Namespace:
         "--slurm-array-parallelism",
         type=int,
         default=20,
-        help="Max concurrent tasks per job array (maps to %%N in --array=0-999%%N)",
+        help=(
+            "Max tasks running concurrently (maps to %%N in --array=0-999%%N). "
+            "Throughput = parallelism / per-task duration, so for short tasks "
+            "raise it (e.g. 50-100) to go faster, subject to cluster capacity."
+        ),
     )
     parser.add_argument(
         "--fail-fast",
@@ -575,6 +579,16 @@ def main(args: argparse.Namespace) -> None:
     logger.info("Total tasks to submit: %d", len(array_inputs))
     logger.info(
         "Submitting in chunks of %d (%d chunks total)...", CHUNK_SIZE, total_chunks
+    )
+    logger.info(
+        "At most %d task(s) run concurrently. Note: the progress bar's 's/task' "
+        "is an aggregate rate (elapsed / completed), NOT the per-task wall time — "
+        "with %d in parallel, a task taking T seconds shows as ~T/%d s/task. A "
+        "slow-looking run usually means slow tasks, or --slurm-array-parallelism "
+        "too low to saturate the cluster.",
+        args.slurm_array_parallelism,
+        args.slurm_array_parallelism,
+        args.slurm_array_parallelism,
     )
 
     process_func = functools.partial(process_line, args.bash_slurm_exec)
