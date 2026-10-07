@@ -125,6 +125,34 @@ Monitor a specific task with:
 tail -f submitit_logs/20260309T143000/12345_0_0.out
 ```
 
+### Monitor your running jobs
+
+`slurm-monitor` renders a live, full-screen table of your active Slurm job
+arrays (running / pending / completing / success / failed / total / done %). It
+refreshes every 2 s by default and quits on `Ctrl-C`.
+
+```bash
+# all of your active job arrays
+slurm-monitor
+
+# follow a single (array) job
+slurm-monitor 123456
+
+# custom refresh interval (seconds)
+slurm-monitor --interval 5
+```
+
+### Analyze submitit logs
+
+`slurm-logs` summarises a submitit log directory (the timestamped folder under
+`--output-dir`): how many tasks succeeded or failed, plus a breakdown of
+failures by likely cause (permission, OOM/killed, Python exceptions,
+socket/Slurm, apptainer).
+
+```bash
+slurm-logs submitit_logs/20260309T143000
+```
+
 ### Throughput & tuning
 
 The progress bar is **not** a measure of task speed. It shows an **aggregate**
@@ -159,13 +187,17 @@ Tuning:
 turboblast/
 ├── src/
 │   └── turboblast/
-│       ├── __init__.py       # Package entry point, exposes __version__
-│       ├── blaster.py        # Core logic: argument parsing, job submission, task execution
-│       └── logo.py           # ASCII art logo used in the CLI help message
+│       ├── __init__.py        # Package entry point, exposes __version__
+│       ├── blaster.py         # Core logic: argument parsing, job submission, task execution
+│       ├── monitor.py         # Live Slurm job array monitor (`slurm-monitor`)
+│       ├── log_analysis.py    # Submitit logs analysis (`slurm-logs`)
+│       └── logo.py            # ASCII art logo used in the CLI help message
 ├── tests/
-│   ├── test_package.py       # Package metadata tests (version check)
-│   └── test_blaster.py       # Unit tests for blaster.py
-├── pyproject.toml            # Build config, dependencies, tool settings
+│   ├── test_package.py        # Package metadata tests (version check)
+│   ├── test_blaster.py        # Unit tests for blaster.py
+│   ├── test_monitor.py        # Unit tests for monitor.py
+│   └── test_log_analysis.py   # Unit tests for log_analysis.py
+├── pyproject.toml             # Build config, dependencies, tool settings
 └── README.md
 ```
 

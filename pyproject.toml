@@ -190,3 +190,5 @@ messages_control.disable = [
 
 [project.scripts]
 turboblaster = "turboblast.blaster:entrypoint"
+slurm-monitor = "turboblast.monitor:entrypoint"
+slurm-logs = "turboblast.log_analysis:entrypoint"
