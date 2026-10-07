@@ -341,7 +341,11 @@ def wait_for_batch_completion(
             stalled_min = (time.monotonic() - last_progress_time) / 60
             if stall_timeout_min > 0 and stalled_min >= stall_timeout_min:
                 stuck_jobs = [j for j in jobs if j.state.upper() not in TERMINAL_STATES]
-                job_ids = {j.job_id.split("_")[0] for j in stuck_jobs}
+                # Cancel only the stuck tasks, by their full per-task id. A
+                # submitit array job_id is "base_task" (e.g. 528266_108);
+                # cancelling the base id would scancel the whole array, not
+                # just the tasks that are stuck.
+                job_ids = sorted(j.job_id for j in stuck_jobs)
                 logger.warning(
                     "Batch %d/%d stalled for %.0f min with %d task(s) "
                     "non-terminal. Cancelling: %s",
@@ -351,8 +355,8 @@ def wait_for_batch_completion(
                     len(stuck_jobs),
                     job_ids,
                 )
-                for jid in job_ids:
-                    subprocess.run(["scancel", jid], check=False)
+                if job_ids:
+                    subprocess.run(["scancel", *job_ids], check=False)
                 # Wait one cycle for Slurm to process the cancellations.
                 time.sleep(BATCH_POLL_INTERVAL)
                 completed = states.get("COMPLETED", 0)
