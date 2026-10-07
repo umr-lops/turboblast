@@ -6,6 +6,7 @@ import pytest
 from turboblast.log_analysis import (
     LogReport,
     _pct,
+    _read,
     analyze_dir,
     entrypoint,
     format_report,
@@ -30,6 +31,21 @@ class TestPct:
 
     def test_zero_total(self):
         assert _pct(3, 0) == "0.0"
+
+
+# ─── _read ───────────────────────────────────────────────────────────────────
+
+
+class TestRead:
+    def test_reads_file(self, tmp_path):
+        f = tmp_path / "a.out"
+        f.write_text("data\n", encoding="utf-8")
+        assert _read(f) == "data\n"
+
+    def test_oserror_returns_empty(self, tmp_path):
+        bad = tmp_path / "missing.out"
+        with patch.object(Path, "read_text", side_effect=OSError("nope")):
+            assert _read(bad) == ""
 
 
 # ─── analyze_dir ─────────────────────────────────────────────────────────────

@@ -1,11 +1,13 @@
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from turboblast.monitor import (
     COLUMNS,
     _format_start,
+    _run,
     build_report,
+    entrypoint,
     fetch_declared_total,
     fetch_job_ids,
     format_row,
@@ -179,6 +181,35 @@ class TestParserArgs:
             args = parser_args()
         assert args.job_id == "42"
         assert args.interval == 5.0
+
+
+# ─── _run ────────────────────────────────────────────────────────────────────
+
+
+class TestRun:
+    def test_returns_stdout(self):
+        proc = MagicMock()
+        proc.stdout = "hello\n"
+        with patch("turboblast.monitor.subprocess.run", return_value=proc):
+            assert _run(["echo", "hello"]) == "hello\n"
+
+    def test_oserror_returns_empty(self):
+        with patch("turboblast.monitor.subprocess.run", side_effect=OSError("nope")):
+            assert _run(["sacct"]) == ""
+
+
+# ─── entrypoint ──────────────────────────────────────────────────────────────
+
+
+class TestEntrypoint:
+    def test_delegates_to_live_monitor(self):
+        with (
+            patch("turboblast.monitor.parser_args") as mock_parser,
+            patch("turboblast.monitor.live_monitor") as mock_live,
+        ):
+            mock_parser.return_value = MagicMock(job_id="7", interval=1.5)
+            entrypoint()
+        mock_live.assert_called_once_with("7", 1.5)
 
 
 # ─── live_monitor ────────────────────────────────────────────────────────────
