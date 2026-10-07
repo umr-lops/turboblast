@@ -125,6 +125,34 @@ Monitor a specific task with:
 tail -f submitit_logs/20260309T143000/12345_0_0.out
 ```
 
+### Throughput & tuning
+
+The progress bar is **not** a measure of task speed. It shows an **aggregate**
+rate, `s/task = elapsed / completed`, not the per-task wall time. With
+`P = --slurm-array-parallelism` tasks running in parallel, a task that actually
+takes `T` seconds shows as `T / P s/task`.
+
+Example: 1000 tasks, each ~83 s (apptainer launch + work), `P = 20`:
+
+```
+164/1000 [12:00<57:41, 4.14s/task, running=20, pending=816]
+```
+
+`4.14 s/task` is `12:00 / 164`; the real per-task time is `4.14 × 20 ≈ 83 s`.
+Nothing is stuck — 20 tasks run, finish, and 20 more are allocated.
+
+Tuning:
+
+- **`--slurm-array-parallelism` (default 20)** caps concurrency. Throughput =
+  `parallelism / per-task duration`. For short tasks, 20 is often far too low (a
+  1000-task batch of ~3 s tasks takes ~2.5 h). Raise it (e.g. 50–100) to
+  saturate the cluster, subject to node capacity and `MaxJobCount`.
+- The first chunk is submitted, then the loop **blocks** until it is terminal
+  before the next chunk (one array in flight at a time) — this keeps the
+  cluster's job-count limits safe.
+- `main()` blocks until all tasks finish; run long jobs under `tmux`/`nohup`.
+- Chunks of 1000 stay under the cluster `MaxArraySize` (1001).
+
 ## Project structure
 
 ```
