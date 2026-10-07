@@ -273,9 +273,48 @@ class TestWaitForBatchCompletion:
             completed, failed = wait_for_batch_completion(
                 jobs, 1, 1, stall_timeout_min=1
             )
-            assert mock_run.call_count == 2
-            mock_run.assert_any_call(["scancel", "12340"], check=False)
-            mock_run.assert_any_call(["scancel", "12341"], check=False)
+            # A single scancel call carrying both (full) task ids.
+            assert mock_run.call_count == 1
+            assert mock_run.call_args[0][0] == ["scancel", "12340", "12341"]
+            assert mock_run.call_args[1].get("check") is False
+            assert completed == 0
+            assert failed == 2
+
+    def test_stall_cancels_full_per_task_ids_not_base(self):
+        """Stall detection must cancel stuck tasks by full per-task id.
+
+        A submitit array job_id is "base_task" (e.g. "528266_108"). Cancelling
+        the base id ("528266") would scancel the whole array, including healthy
+        pending tasks, instead of only the stuck ones.
+        """
+        jobs = []
+        for task in (108, 182):
+            job = MagicMock()
+            type(job).state = PropertyMock(return_value="RUNNING")
+            job.job_id = f"528266_{task}"
+            jobs.append(job)
+
+        time_values = [0.0, 0.1, 0.2, 0.3, 0.4, 120.0] * 10
+        mock_monotonic = MagicMock(side_effect=time_values)
+
+        with (
+            patch("turboblast.blaster.time.sleep") as _,
+            patch("turboblast.blaster.BATCH_POLL_INTERVAL", 0.001),
+            patch("turboblast.blaster.tqdm"),
+            patch("turboblast.blaster.subprocess.run") as mock_run,
+            patch("time.monotonic", mock_monotonic),
+        ):
+            completed, failed = wait_for_batch_completion(
+                jobs, 1, 1, stall_timeout_min=1
+            )
+            # One scancel, with the full per-task ids — never the base id.
+            assert mock_run.call_count == 1
+            assert mock_run.call_args[0][0] == [
+                "scancel",
+                "528266_108",
+                "528266_182",
+            ]
+            assert mock_run.call_args[1].get("check") is False
             assert completed == 0
             assert failed == 2
 
