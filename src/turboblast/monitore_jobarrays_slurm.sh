@@ -8,6 +8,15 @@ TARGET_ID=$1
 echo -ne "\033[?25l"
 trap 'echo -ne "\033[?25h"; exit' INTERRUPT SIGTERM EXIT
 
+# Declared array size (batch x batch_size) reported by the scheduler.
+# sacct only lists the tasks that already have an accounting record, so it
+# under-counts the total; scontrol keeps the full declared size while the job
+# is still scheduled. Empty for non-array jobs or once the job is purged.
+array_total() {
+    scontrol show job "$1" 2>/dev/null |
+        grep -oE 'ArrayTaskCount=[0-9]+' | cut -d= -f2 | head -n 1
+}
+
 while true; do
     printf "\033[H\033[J"
     if [ -n "$TARGET_ID" ]; then
@@ -58,15 +67,30 @@ while true; do
                 START_DISP=$(echo "$START_RAW" | cut -c 6-16 | sed 's/T/ /')
             fi
 
+            # The total must be the number of jobs that will be submitted
+            # (batch x batch_size), i.e. the declared array size, not the
+            # number of sacct lines (tasks already recorded). For the state
+            # counts, drop the array "parent" line (base id, no _<task>) so
+            # each task is counted exactly once.
+            DECLARED_TOTAL=$(array_total "$id")
+            if [ -n "$DECLARED_TOTAL" ]; then
+                TASK_DATA=$(echo "$RAW_DATA" | awk -v base="$id" '$1 != base {print}')
+                TOTAL=$DECLARED_TOTAL
+            else
+                # Non-array job, or job purged from the scheduler: fall back
+                # to the number of lines returned by sacct.
+                TASK_DATA=$RAW_DATA
+                TOTAL=$(echo "$RAW_DATA" | wc -l)
+            fi
+
             # Count States
-            R=$(echo "$RAW_DATA" | grep -c "RUNNING")
-            P=$(echo "$RAW_DATA" | grep -c "PENDING")
-            C=$(echo "$RAW_DATA" | grep -c "COMPLETING")
-            OK=$(echo "$RAW_DATA" | grep -c "COMPLETED")
-            FAIL=$(echo "$RAW_DATA" | grep -c -E "FAILED|TIMEOUT|CANCELLED|NODE_FAIL")
+            R=$(echo "$TASK_DATA" | grep -c "RUNNING")
+            P=$(echo "$TASK_DATA" | grep -c "PENDING")
+            C=$(echo "$TASK_DATA" | grep -c "COMPLETING")
+            OK=$(echo "$TASK_DATA" | grep -c "COMPLETED")
+            FAIL=$(echo "$TASK_DATA" | grep -c -E "FAILED|TIMEOUT|CANCELLED|NODE_FAIL")
 
             # Calculations
-            TOTAL=$(echo "$RAW_DATA" | wc -l)
             FINISHED=$((OK + FAIL))
             PERC=$([ "$TOTAL" -gt 0 ] && echo "$(( 100 * FINISHED / TOTAL ))" || echo "0")
 
