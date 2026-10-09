@@ -1,5 +1,6 @@
 import argparse
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -577,21 +578,25 @@ class TestMain:
             batch_wall_timeout_min=0,
         )
 
-    def _instant_batch(self, completed=0, failed=0):
+    def _instant_batch(
+        self, completed: int = 0, failed: int = 0
+    ) -> Callable[[], MagicMock]:
         """Build an ArrayBatch mock whose instance finishes on the first poll."""
         batch = MagicMock()
         batch.completed = completed
         batch.failed = failed
         batch.done = False
 
-        def _poll(_now):
+        def _poll(_now: float) -> bool:
             batch.done = True
             return True
 
         batch.poll.side_effect = _poll
         return batch
 
-    def _run(self, args, batch_factory):
+    def _run(
+        self, args: argparse.Namespace, batch_factory: Callable[[], MagicMock]
+    ) -> tuple[MagicMock, MagicMock]:
         batch_cls = MagicMock(side_effect=batch_factory)
         ex = MagicMock()
         ex.map_array.return_value = [MagicMock()]
