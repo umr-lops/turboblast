@@ -1,5 +1,6 @@
 import argparse
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -7,6 +8,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 from turboblast.blaster import (
+    ArrayBatch,
     main,
     parse_memory_to_gb,
     parser_args,
@@ -124,6 +126,7 @@ class TestParserArgs:
             assert args.slurm_array_parallelism == 20
             assert args.output_dir == "submitit_logs_array"
             assert args.fail_fast is False
+            assert args.max_arrays_inflight == 2
             # None = "derive from --timeout-min in main()"; the old 0 (disabled)
             # is replaced by an always-on backstop.
             assert args.batch_stall_timeout_min is None
@@ -168,6 +171,14 @@ class TestParserArgs:
         ):
             args = parser_args()
             assert args.batch_stall_timeout_min == 15
+
+    def test_max_arrays_inflight(self):
+        with patch(
+            "sys.argv",
+            ["blaster", *self.BASE_ARGS, "--max-arrays-inflight", "3"],
+        ):
+            args = parser_args()
+            assert args.max_arrays_inflight == 3
 
     def test_missing_required_args_exits(self):
         with patch("sys.argv", ["blaster"]), pytest.raises(SystemExit):
@@ -339,6 +350,44 @@ class TestWaitForBatchCompletion:
             completed, failed = wait_for_batch_completion(jobs, 1, 1, 0)
             assert completed == 1
             assert failed == 0
+
+
+# ─── ArrayBatch state-fetch edge cases ────────────────────────────────────────
+
+
+class TestArrayBatchStateErrors:
+    def _job_with_state_side_effect(self, effect) -> MagicMock:
+        job = MagicMock()
+        job.job_id = "1234_1"
+        type(job).state = PropertyMock(side_effect=effect)
+        return job
+
+    def test_oserror_during_state_fetch_is_unknown(self):
+        """An OSError while polling a state is treated as UNKNOWN (not terminal),
+        so the batch keeps polling and later completes."""
+        job = self._job_with_state_side_effect([OSError("slurm gone"), "COMPLETED"])
+        with patch("turboblast.blaster.tqdm"):
+            batch = ArrayBatch([job], 1, 1)
+            assert batch.poll(0.0) is False
+            assert batch.poll(60.0) is True
+            assert (batch.completed, batch.failed) == (1, 0)
+
+    def test_systemexit_during_state_fetch_propagates(self):
+        """A SystemExit raised while polling must propagate, not be swallowed."""
+        job = self._job_with_state_side_effect(SystemExit(3))
+        with patch("turboblast.blaster.tqdm"):
+            batch = ArrayBatch([job], 1, 1)
+            with pytest.raises(SystemExit):
+                batch.poll(0.0)
+
+    def test_set_position_moves_the_progress_bar(self):
+        """set_position() repositions the batch's progress bar (pipelining)."""
+        with patch("turboblast.blaster.tqdm"):
+            batch = ArrayBatch([MagicMock()], 1, 1)
+            batch.set_position(2)
+            assert batch.position == 2
+            assert batch.pbar.position == 2
+            batch.pbar.refresh.assert_called_once()
 
 
 # ─── Per-task stuck detection & batch wall-time (Phase 1 fixes #2-#4) ────────
@@ -536,6 +585,14 @@ class TestPerTaskStuckDetection:
 
 
 class TestMain:
+    """Tests for the pipelined submission loop in main().
+
+    ``main`` no longer calls ``wait_for_batch_completion``; it drives
+    :class:`ArrayBatch` instances directly. We therefore mock ``ArrayBatch``
+    (the class main imports) so each submitted array finishes immediately,
+    letting the loop run without sleeping.
+    """
+
     def _make_args(
         self, tmp_path: Path, lines: list[str] | None = None
     ) -> argparse.Namespace:
@@ -554,134 +611,186 @@ class TestMain:
             slurm_partition="cpu",
             slurm_array_parallelism=20,
             fail_fast=False,
+            max_arrays_inflight=1,
             batch_stall_timeout_min=0,
             task_stuck_min=15.0,
             batch_wall_timeout_min=0,
         )
 
-    def test_submits_jobs(self, tmp_path):
-        args = self._make_args(tmp_path)
-        mock_executor = MagicMock()
-        mock_job = MagicMock()
-        mock_job.job_id = "12345"
-        mock_executor.map_array.return_value = [mock_job, mock_job]
+    def _instant_batch(
+        self, completed: int = 0, failed: int = 0
+    ) -> Callable[[], MagicMock]:
+        """Build an ArrayBatch mock whose instance finishes on the first poll."""
+        batch = MagicMock()
+        batch.completed = completed
+        batch.failed = failed
+        batch.done = False
 
+        def _poll(_now: float) -> bool:
+            batch.done = True
+            return True
+
+        batch.poll.side_effect = _poll
+        return batch
+
+    def _run(
+        self, args: argparse.Namespace, batch_factory: Callable[[], MagicMock]
+    ) -> tuple[MagicMock, MagicMock]:
+        batch_cls = MagicMock(side_effect=batch_factory)
+        ex = MagicMock()
+        ex.map_array.return_value = [MagicMock()]
         with (
-            patch(
-                "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
-            ),
-            patch("turboblast.blaster.wait_for_batch_completion", return_value=(2, 0)),
+            patch("turboblast.blaster.ArrayBatch", batch_cls),
+            patch("turboblast.blaster.submitit.AutoExecutor", return_value=ex),
+            patch("turboblast.blaster.time.sleep"),
         ):
             main(args)
-            call_args = mock_executor.map_array.call_args
-            assert call_args is not None
-            assert len(call_args[0][1]) == 2
+        return ex, batch_cls
+
+    def test_submits_jobs(self, tmp_path):
+        args = self._make_args(tmp_path)
+        ex, _ = self._run(args, self._instant_batch(2, 0))
+        call_args = ex.map_array.call_args
+        assert call_args is not None
+        assert len(call_args[0][1]) == 2
 
     def test_empty_input_file_aborts(self, tmp_path):
         args = self._make_args(tmp_path, lines=[])
-        mock_executor = MagicMock()
-        with patch(
-            "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
-        ):
-            main(args)
-            mock_executor.map_array.assert_not_called()
+        ex, _ = self._run(args, self._instant_batch())
+        ex.map_array.assert_not_called()
 
     def test_chunks_large_input(self, tmp_path):
         args = self._make_args(tmp_path, lines=[f"--input {i}.nc" for i in range(2500)])
-        mock_executor = MagicMock()
-        mock_job = MagicMock()
-        mock_job.job_id = "99"
-        mock_executor.map_array.return_value = [mock_job]
-
-        with (
-            patch(
-                "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
-            ),
-            patch(
-                "turboblast.blaster.wait_for_batch_completion", return_value=(1000, 0)
-            ),
-        ):
-            main(args)
-            assert mock_executor.map_array.call_count == 3
+        ex, _ = self._run(args, self._instant_batch(1000, 0))
+        assert ex.map_array.call_count == 3
 
     def test_blank_lines_ignored(self, tmp_path):
         args = self._make_args(
             tmp_path, lines=["--input a.nc", "", "  ", "--input b.nc"]
         )
-        mock_executor = MagicMock()
-        mock_job = MagicMock()
-        mock_job.job_id = "1"
-        mock_executor.map_array.return_value = [mock_job, mock_job]
-
-        with (
-            patch(
-                "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
-            ),
-            patch("turboblast.blaster.wait_for_batch_completion", return_value=(2, 0)),
-        ):
-            main(args)
-            submitted = mock_executor.map_array.call_args[0][1]
-            assert len(submitted) == 2
+        ex, _ = self._run(args, self._instant_batch())
+        submitted = ex.map_array.call_args[0][1]
+        assert len(submitted) == 2
 
     def test_fail_fast_stops_after_first_failure(self, tmp_path):
         args = self._make_args(tmp_path, lines=[f"--input {i}.nc" for i in range(2500)])
         args.fail_fast = True
-        mock_executor = MagicMock()
-        mock_job = MagicMock()
-        mock_job.job_id = "99"
-        mock_executor.map_array.return_value = [mock_job]
-
-        with (
-            patch(
-                "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
-            ),
-            patch(
-                "turboblast.blaster.wait_for_batch_completion", return_value=(900, 100)
-            ),
-        ):
-            main(args)
-            assert mock_executor.map_array.call_count == 1
+        # max=1 so only batch 1 is submitted; it reports failures -> stop.
+        args.max_arrays_inflight = 1
+        ex, _ = self._run(args, self._instant_batch(900, 100))
+        assert ex.map_array.call_count == 1
 
     def test_fail_fast_false_continues_after_failures(self, tmp_path):
-        """With fail_fast=False, continue to next batches even if failures occur."""
+        """With fail_fast=False, continue to all batches even after failures."""
         args = self._make_args(tmp_path, lines=[f"--input {i}.nc" for i in range(2500)])
         args.fail_fast = False
-        mock_executor = MagicMock()
-        mock_job = MagicMock()
-        mock_job.job_id = "99"
-        mock_executor.map_array.return_value = [mock_job]
+        ex, _ = self._run(args, self._instant_batch(900, 100))
+        assert ex.map_array.call_count == 3
 
-        # Trois chunks → trois résultats
-        side_effects = [
-            (900, 100),
-            (1000, 0),
-            (1000, 0),
-        ]  # premier échoue, les autres réussissent
+    def test_pipelined_keeps_k_arrays_inflight(self, tmp_path):
+        """With max_arrays_inflight=K, K arrays are submitted before any drains,
+        then the rest as slots free (pipelining, not sequential)."""
+        args = self._make_args(tmp_path, lines=[f"--input {i}.nc" for i in range(2500)])
+        args.max_arrays_inflight = 2
+        ex, batch_cls = self._run(args, self._instant_batch(1000, 0))
+
+        # 3 chunks total; all three are submitted (2 up front + 1 as a slot frees).
+        assert ex.map_array.call_count == 3
+        assert batch_cls.call_count == 3
+        # Every chunk was split into <= CHUNK_SIZE (1000) tasks.
+        for c in ex.map_array.call_args_list:
+            assert len(c[0][1]) <= 1000
+
+    def test_pipelined_arrays_overlap_in_time(self, tmp_path):
+        """Prove pipelining, not sequential: with K=2, the second array is
+        submitted *before* the first one is polled to completion (they overlap).
+        With the old sequential design, batch 2 would only be submitted after
+        batch 1's poll returned done.
+        """
+        args = self._make_args(tmp_path, lines=[f"--input {i}.nc" for i in range(2500)])
+        args.max_arrays_inflight = 2
+
+        events: list[str] = []
+
+        class SlowBatch:
+            def __init__(self, _jobs, chunk_idx, _total_chunks, **_kwargs):
+                self.chunk_idx = chunk_idx
+                self.completed = 1000
+                self.failed = 0
+                self.done = False
+                events.append(f"submit-{self.chunk_idx}")
+
+            def set_position(self, _position):
+                pass
+
+            def poll(self, _now):
+                events.append(f"poll-{self.chunk_idx}")
+                self.done = True
+                return True
+
+        ex = MagicMock()
+        ex.map_array.return_value = [MagicMock()]
         with (
-            patch(
-                "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
-            ),
-            patch(
-                "turboblast.blaster.wait_for_batch_completion",
-                side_effect=side_effects,
-            ),
+            patch("turboblast.blaster.ArrayBatch", SlowBatch),
+            patch("turboblast.blaster.submitit.AutoExecutor", return_value=ex),
+            patch("turboblast.blaster.time.sleep"),
         ):
             main(args)
-            # fail_fast=False → tous les chunks sont soumis
-            assert mock_executor.map_array.call_count == 3
+
+        # The second batch must be submitted before the first is polled done.
+        assert events.index("submit-2") < events.index("poll-1")
+        assert ex.map_array.call_count == 3
+
+    def test_sequential_when_k_is_one(self, tmp_path):
+        """With K=1 (the legacy behavior) arrays never overlap: each is polled to
+        completion before the next is submitted."""
+        args = self._make_args(tmp_path, lines=[f"--input {i}.nc" for i in range(2500)])
+        args.max_arrays_inflight = 1
+
+        events: list[str] = []
+
+        class SlowBatch:
+            def __init__(self, _jobs, chunk_idx, _total_chunks, **_kwargs):
+                self.chunk_idx = chunk_idx
+                self.completed = 1000
+                self.failed = 0
+                self.done = False
+                events.append(f"submit-{self.chunk_idx}")
+
+            def set_position(self, _position):
+                pass
+
+            def poll(self, _now):
+                events.append(f"poll-{self.chunk_idx}")
+                self.done = True
+                return True
+
+        ex = MagicMock()
+        ex.map_array.return_value = [MagicMock()]
+        with (
+            patch("turboblast.blaster.ArrayBatch", SlowBatch),
+            patch("turboblast.blaster.submitit.AutoExecutor", return_value=ex),
+            patch("turboblast.blaster.time.sleep"),
+        ):
+            main(args)
+
+        # Sequential: submit 1, poll 1 (done), submit 2, poll 2 (done), submit 3.
+        assert events.index("submit-2") > events.index("poll-1")
+        assert events.index("submit-3") > events.index("poll-2")
+        assert ex.map_array.call_count == 3
+
+    def test_fill_stops_when_no_chunks_left(self, tmp_path):
+        """The pipeline-fill loop calls _submit_next() past the last chunk: it
+        must return False (not crash) and submit exactly the available chunks."""
+        args = self._make_args(tmp_path)  # 2 lines -> 1 chunk
+        args.max_arrays_inflight = 2  # deeper pipeline than available chunks
+        ex, _ = self._run(args, self._instant_batch())
+        assert ex.map_array.call_count == 1
 
     def test_output_dir_creation_with_timestamp(self, tmp_path):
         args = self._make_args(tmp_path)
-        mock_executor = MagicMock()
-        mock_executor.map_array.return_value = [MagicMock(), MagicMock()]
-        with (
-            patch(
-                "turboblast.blaster.submitit.AutoExecutor", return_value=mock_executor
-            ),
-            patch("turboblast.blaster.wait_for_batch_completion", return_value=(2, 0)),
-        ):
-            main(args)
-            output_dir = Path(args.output_dir)
-            subdirs = list(output_dir.glob("*"))
-            assert len(subdirs) == 1
-            assert subdirs[0].name.startswith("20")
+        self._run(args, self._instant_batch())
+        output_dir = Path(args.output_dir)
+        subdirs = list(output_dir.glob("*"))
+        assert len(subdirs) == 1
+        assert subdirs[0].name.startswith("20")
