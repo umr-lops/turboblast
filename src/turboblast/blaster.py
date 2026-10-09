@@ -796,7 +796,9 @@ def parser_args() -> argparse.Namespace:
         help=(
             "Hard cap on total batch wall time (minutes). A batch running longer "
             "is force-finished (remaining tasks cancelled) so it cannot stall the "
-            "chain. Default: --timeout-min * 4 + 60. Use 0 to disable."
+            "chain. Default: auto, per chunk (2x the theoretical max healthy "
+            "duration: 2 x ceil(chunk/parallelism) x (--timeout-min + 15)). "
+            "Use 0 to disable."
         ),
     )
     return parser.parse_args()

@@ -27,7 +27,8 @@ parallel.
 The core idea is simple: you provide a text file where each line is a set of
 arguments, and turboblast dispatches each line as an independent Slurm task
 running a bash script of your choice. Large input lists are automatically split
-into chunks of 1000 to stay within Slurm array limits.
+into chunks of 1000 to stay within Slurm array limits and are submitted as a
+pipeline (several job arrays in flight at a time) so the cluster stays busy.
 
 ### Dependencies
 
@@ -79,7 +80,7 @@ turboblaster \
   --bash-slurm-exec process.sh \
   --slurm-partition gpu \
   --timeout-min 60 \
-  --mem-gb 8 \
+  --mem 8G \
   --cpus-per-task 4 \
   --slurm-array-parallelism 50 \
   --output-dir submitit_logs
@@ -89,40 +90,49 @@ turboblaster \
 
 ```
 usage: turboblaster [-h] [--num-tasks NUM_TASKS] [--timeout-min TIMEOUT_MIN]
-                    [--mem-gb MEM_GB] [--cpus-per-task CPUS_PER_TASK]
+                    [--mem MEM] [--cpus-per-task CPUS_PER_TASK]
                     [--slurm-partition SLURM_PARTITION]
                     --listing-input LISTING_INPUT
                     --bash-slurm-exec BASH_SLURM_EXEC
                     [--output-dir OUTPUT_DIR]
                     [--slurm-array-parallelism SLURM_ARRAY_PARALLELISM]
+                    [--fail-fast] [--max-arrays-inflight MAX_ARRAYS_INFLIGHT]
+                    [--batch-stall-timeout-min BATCH_STALL_TIMEOUT_MIN]
+                    [--task-stuck-min TASK_STUCK_MIN]
+                    [--batch-wall-timeout-min BATCH_WALL_TIMEOUT_MIN]
 
 options:
   --listing-input            Path to a file containing input lines (one task per line) [required]
   --bash-slurm-exec          Path to the bash script to execute for each task [required]
   --num-tasks                Number of tasks (unused if reading from file) [default: 20]
   --timeout-min              Timeout in minutes for each task [default: 20]
-  --mem-gb                   Memory in GB for each task [default: 2]
+  --mem                      Memory per task, integer with optional unit suffix (M/MB/G/GB) [default: 2G]
   --cpus-per-task            Number of CPUs per task [default: 1]
   --slurm-partition          Slurm partition to use [default: cpu]
   --output-dir               Directory to store submitit logs [default: submitit_logs_array]
   --slurm-array-parallelism  Max number of tasks running concurrently [default: 20]
+  --fail-fast                Stop submitting further arrays if any task in a batch fails
+  --max-arrays-inflight      Job arrays kept in flight at once (pipelining) [default: 2]
+  --batch-stall-timeout-min  No-progress backstop, minutes; 0 = disabled [default: --timeout-min + 15]
+  --task-stuck-min           Per-task timeout (min) for tasks in HELD/REQUEUE_HOLD/COMPLETING [default: 15]
+  --batch-wall-timeout-min   Hard cap on total batch wall time (min); 0 = disabled [default: auto per chunk]
 ```
 
-Submitit logs (`.out` / `.err` files) are written to a timestamped subdirectory
-under `--output-dir`:
+Submitit logs (`.out` files) are written to a timestamped subdirectory under
+`--output-dir`:
 
 ```
 submitit_logs/
 └── 20260309T143000/
-    ├── 12345_0_0.out
-    ├── 12345_1_0.out
+    ├── 12345_0_0_log.out
+    ├── 12345_1_0_log.out
     └── ...
 ```
 
 Monitor a specific task with:
 
 ```bash
-tail -f submitit_logs/20260309T143000/12345_0_0.out
+tail -f submitit_logs/20260309T143000/12345_0_0_log.out
 ```
 
 ### Monitor your running jobs
@@ -175,11 +185,29 @@ Tuning:
   `parallelism / per-task duration`. For short tasks, 20 is often far too low (a
   1000-task batch of ~3 s tasks takes ~2.5 h). Raise it (e.g. 50–100) to
   saturate the cluster, subject to node capacity and `MaxJobCount`.
-- The first chunk is submitted, then the loop **blocks** until it is terminal
-  before the next chunk (one array in flight at a time) — this keeps the
-  cluster's job-count limits safe.
+- Submission is **pipelined**: up to `--max-arrays-inflight` (default 2) job
+  arrays are in flight at once, and the next chunk is submitted as soon as a
+  slot frees — the cluster stays busy instead of idle while the last tasks of a
+  chunk finish. Keep `--max-arrays-inflight` under the cluster's `MaxJobCount`;
+  overall concurrency = `--max-arrays-inflight` × `--slurm-array-parallelism`.
 - `main()` blocks until all tasks finish; run long jobs under `tmux`/`nohup`.
 - Chunks of 1000 stay under the cluster `MaxArraySize` (1001).
+
+### Stuck-task protection
+
+A task stuck in a non-running state (e.g. `PENDING`, `HELD`, `REQUEUE_HOLD`) no
+longer blocks the whole run. Each array is protected by three layers:
+
+- **Per-task stuck timeout** (`--task-stuck-min`, default 15): a task sitting in
+  a hold/transient state (HELD / REQUEUE_HOLD / REQUEUED / COMPLETING / STOPPED)
+  that long is cancelled by its own id; `RUNNING` tasks are bounded by
+  `--timeout-min + 15`.
+- **No-progress backstop** (`--batch-stall-timeout-min`, default
+  `--timeout-min + 15`): if _no_ task reaches a terminal state for that long
+  (e.g. 999 done, 1 stuck), the remaining tasks are cancelled and the batch
+  moves on.
+- **Batch wall-time cap** (`--batch-wall-timeout-min`, auto per chunk): a hard
+  maximum wall time per batch, so no single batch can stall the chain.
 
 ## Project structure
 
