@@ -124,7 +124,11 @@ class TestParserArgs:
             assert args.slurm_array_parallelism == 20
             assert args.output_dir == "submitit_logs_array"
             assert args.fail_fast is False
-            assert args.batch_stall_timeout_min == 0
+            # None = "derive from --timeout-min in main()"; the old 0 (disabled)
+            # is replaced by an always-on backstop.
+            assert args.batch_stall_timeout_min is None
+            assert args.task_stuck_min == 15.0
+            assert args.batch_wall_timeout_min is None
 
     def test_custom_mem_gb(self):
         with patch("sys.argv", ["blaster", *self.BASE_ARGS, "--mem", "8G"]):
@@ -337,6 +341,197 @@ class TestWaitForBatchCompletion:
             assert failed == 0
 
 
+# ─── Per-task stuck detection & batch wall-time (Phase 1 fixes #2-#4) ────────
+
+
+class _FakeClock:
+    """A controllable monotonic clock: returns values in order, one per call.
+
+    Once the list is exhausted it keeps returning the last value (so the loop
+    can spin without StopIteration if a test miscounted its polls).
+    """
+
+    def __init__(self, values: list[float]):
+        self._values = list(values)
+        self._i = 0
+
+    def __call__(self) -> float:
+        v = self._values[min(self._i, len(self._values) - 1)]
+        self._i += 1
+        return v
+
+
+def _make_job(job_id: str, states: list[str]) -> MagicMock:
+    job = MagicMock()
+    job.job_id = job_id
+    type(job).state = PropertyMock(side_effect=states)
+    return job
+
+
+class TestPerTaskStuckDetection:
+    def test_held_task_cancelled_individually(self):
+        """A task stuck in HELD is cancelled by its full id while healthy tasks
+        keep running; the batch then finishes (fixes #2 and #3)."""
+        # job1: HELD (stuck) -> cancelled. job2: healthy, completes.
+        job1 = _make_job("5001", ["HELD", "HELD", "CANCELLED"])
+        job2 = _make_job("5002", ["RUNNING", "COMPLETED", "COMPLETED"])
+        jobs = [job1, job2]
+
+        # batch_start=0, poll1=60s, poll2=180s (job1 HELD for 2 min >= 1 min),
+        # poll3=240s (job1 now CANCELLED, job2 COMPLETED -> all terminal).
+        clock = _FakeClock([0.0, 60.0, 180.0, 240.0])
+        with (
+            patch("turboblast.blaster.time.sleep"),
+            patch("turboblast.blaster.BATCH_POLL_INTERVAL", 0.001),
+            patch("turboblast.blaster.tqdm"),
+            patch("turboblast.blaster.subprocess.run") as mock_run,
+            patch("time.monotonic", clock),
+        ):
+            completed, failed = wait_for_batch_completion(
+                jobs,
+                1,
+                1,
+                stall_timeout_min=0,
+                task_stuck_min=1,
+                batch_wall_timeout_min=0,
+            )
+
+        # Only the HELD task (full per-task id) is cancelled — exactly one scancel.
+        assert mock_run.call_count == 1
+        assert mock_run.call_args[0][0] == ["scancel", "5001"]
+        assert mock_run.call_args[1].get("check") is False
+        assert completed == 1
+        assert failed == 1
+
+    def test_lone_pending_task_caught_by_no_progress_backstop(self):
+        """Reproduces the reported bug: 999/1000 done, 1 task stuck in PENDING.
+        PENDING has no per-task limit (it's the normal queue state), but once it's
+        the only task left there is no progress, so the backstop cancels it
+        (fix #1)."""
+        job1 = _make_job("6001", ["PENDING", "PENDING"])
+        job2 = _make_job("6002", ["COMPLETED", "COMPLETED"])
+        jobs = [job1, job2]
+
+        # batch_start=0, poll1=30s (job2 completes -> progress), poll2=150s
+        # (2 min with no new progress >= 1 min backstop -> cancel job1).
+        clock = _FakeClock([0.0, 30.0, 150.0])
+        with (
+            patch("turboblast.blaster.time.sleep"),
+            patch("turboblast.blaster.BATCH_POLL_INTERVAL", 0.001),
+            patch("turboblast.blaster.tqdm"),
+            patch("turboblast.blaster.subprocess.run") as mock_run,
+            patch("time.monotonic", clock),
+        ):
+            completed, failed = wait_for_batch_completion(
+                jobs,
+                1,
+                1,
+                stall_timeout_min=1,
+                task_stuck_min=15,
+                batch_wall_timeout_min=0,
+            )
+
+        assert mock_run.call_count == 1
+        assert mock_run.call_args[0][0] == ["scancel", "6001"]
+        assert completed == 1
+        assert failed == 1
+
+    def test_running_task_bounded_by_task_timeout(self):
+        """A RUNNING task is bounded by --timeout-min + grace (Slurm should have
+        killed it at its wall limit); past that it is cancelled (fix #3)."""
+        job1 = _make_job("7001", ["RUNNING", "RUNNING", "CANCELLED"])
+        jobs = [job1]
+
+        # task_timeout_min=1 -> RUNNING threshold = 1 + 15 = 16 min.
+        # batch_start=0, poll1=60s, poll2=1020s (RUNNING 16 min -> cancel),
+        # poll3=1080s (now CANCELLED -> terminal).
+        clock = _FakeClock([0.0, 60.0, 1020.0, 1080.0])
+        with (
+            patch("turboblast.blaster.time.sleep"),
+            patch("turboblast.blaster.BATCH_POLL_INTERVAL", 0.001),
+            patch("turboblast.blaster.tqdm"),
+            patch("turboblast.blaster.subprocess.run") as mock_run,
+            patch("time.monotonic", clock),
+        ):
+            completed, failed = wait_for_batch_completion(
+                jobs,
+                1,
+                1,
+                stall_timeout_min=0,
+                task_stuck_min=15,
+                batch_wall_timeout_min=0,
+                task_timeout_min=1,
+            )
+
+        assert mock_run.call_count == 1
+        assert mock_run.call_args[0][0] == ["scancel", "7001"]
+        assert completed == 0
+        assert failed == 1
+
+    def test_state_change_resets_clock_no_false_positive(self):
+        """A task queued (PENDING) a while then RUNNING must NOT be cancelled just
+        because its *total* non-terminal time is large — the clock resets when it
+        enters RUNNING (anti false-positive for busy queues)."""
+        job1 = _make_job("9001", ["PENDING", "PENDING", "RUNNING", "COMPLETED"])
+        jobs = [job1]
+
+        # task_timeout_min=1 -> RUNNING threshold 16 min. The task is PENDING for
+        # 60s, then RUNNING for 60s (well under 16 min), then completes. It must
+        # never be cancelled.
+        clock = _FakeClock([0.0, 600.0, 660.0, 720.0, 780.0])
+        with (
+            patch("turboblast.blaster.time.sleep"),
+            patch("turboblast.blaster.BATCH_POLL_INTERVAL", 0.001),
+            patch("turboblast.blaster.tqdm"),
+            patch("turboblast.blaster.subprocess.run") as mock_run,
+            patch("time.monotonic", clock),
+        ):
+            completed, failed = wait_for_batch_completion(
+                jobs,
+                1,
+                1,
+                stall_timeout_min=0,
+                task_stuck_min=15,
+                batch_wall_timeout_min=0,
+                task_timeout_min=1,
+            )
+
+        # No cancellation at all — the task was healthy.
+        assert mock_run.call_count == 0
+        assert completed == 1
+        assert failed == 0
+
+    def test_batch_wall_timeout_force_finishes(self):
+        """A hard per-batch wall-time cap force-finishes the batch (fix #4)."""
+        job1 = _make_job("8001", ["RUNNING", "RUNNING"])
+        jobs = [job1]
+
+        # wall cap = 1 min. batch_start=0, poll1=30s (under cap), poll2=90s
+        # (1.5 min >= 1 min cap -> force finish, cancel job1).
+        clock = _FakeClock([0.0, 30.0, 90.0])
+        with (
+            patch("turboblast.blaster.time.sleep"),
+            patch("turboblast.blaster.BATCH_POLL_INTERVAL", 0.001),
+            patch("turboblast.blaster.tqdm"),
+            patch("turboblast.blaster.subprocess.run") as mock_run,
+            patch("time.monotonic", clock),
+        ):
+            completed, failed = wait_for_batch_completion(
+                jobs,
+                1,
+                1,
+                stall_timeout_min=0,
+                task_stuck_min=15,
+                batch_wall_timeout_min=1,
+                task_timeout_min=20,
+            )
+
+        assert mock_run.call_count == 1
+        assert mock_run.call_args[0][0] == ["scancel", "8001"]
+        assert completed == 0
+        assert failed == 1
+
+
 # ─── main ─────────────────────────────────────────────────────────────────────
 
 
@@ -360,6 +555,8 @@ class TestMain:
             slurm_array_parallelism=20,
             fail_fast=False,
             batch_stall_timeout_min=0,
+            task_stuck_min=15.0,
+            batch_wall_timeout_min=0,
         )
 
     def test_submits_jobs(self, tmp_path):
