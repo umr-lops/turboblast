@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 from turboblast.blaster import (
+    ArrayBatch,
     main,
     parse_memory_to_gb,
     parser_args,
@@ -349,6 +350,44 @@ class TestWaitForBatchCompletion:
             completed, failed = wait_for_batch_completion(jobs, 1, 1, 0)
             assert completed == 1
             assert failed == 0
+
+
+# ─── ArrayBatch state-fetch edge cases ────────────────────────────────────────
+
+
+class TestArrayBatchStateErrors:
+    def _job_with_state_side_effect(self, effect) -> MagicMock:
+        job = MagicMock()
+        job.job_id = "1234_1"
+        type(job).state = PropertyMock(side_effect=effect)
+        return job
+
+    def test_oserror_during_state_fetch_is_unknown(self):
+        """An OSError while polling a state is treated as UNKNOWN (not terminal),
+        so the batch keeps polling and later completes."""
+        job = self._job_with_state_side_effect([OSError("slurm gone"), "COMPLETED"])
+        with patch("turboblast.blaster.tqdm"):
+            batch = ArrayBatch([job], 1, 1)
+            assert batch.poll(0.0) is False
+            assert batch.poll(60.0) is True
+            assert (batch.completed, batch.failed) == (1, 0)
+
+    def test_systemexit_during_state_fetch_propagates(self):
+        """A SystemExit raised while polling must propagate, not be swallowed."""
+        job = self._job_with_state_side_effect(SystemExit(3))
+        with patch("turboblast.blaster.tqdm"):
+            batch = ArrayBatch([job], 1, 1)
+            with pytest.raises(SystemExit):
+                batch.poll(0.0)
+
+    def test_set_position_moves_the_progress_bar(self):
+        """set_position() repositions the batch's progress bar (pipelining)."""
+        with patch("turboblast.blaster.tqdm"):
+            batch = ArrayBatch([MagicMock()], 1, 1)
+            batch.set_position(2)
+            assert batch.position == 2
+            assert batch.pbar.position == 2
+            batch.pbar.refresh.assert_called_once()
 
 
 # ─── Per-task stuck detection & batch wall-time (Phase 1 fixes #2-#4) ────────
@@ -739,6 +778,14 @@ class TestMain:
         assert events.index("submit-2") > events.index("poll-1")
         assert events.index("submit-3") > events.index("poll-2")
         assert ex.map_array.call_count == 3
+
+    def test_fill_stops_when_no_chunks_left(self, tmp_path):
+        """The pipeline-fill loop calls _submit_next() past the last chunk: it
+        must return False (not crash) and submit exactly the available chunks."""
+        args = self._make_args(tmp_path)  # 2 lines -> 1 chunk
+        args.max_arrays_inflight = 2  # deeper pipeline than available chunks
+        ex, _ = self._run(args, self._instant_batch())
+        assert ex.map_array.call_count == 1
 
     def test_output_dir_creation_with_timestamp(self, tmp_path):
         args = self._make_args(tmp_path)
