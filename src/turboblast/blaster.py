@@ -353,24 +353,17 @@ def _force_finish_batch(
     return completed, failed
 
 
-def wait_for_batch_completion(
-    jobs: list[submitit.Job],
-    chunk_idx: int,
-    total_chunks: int,
-    stall_timeout_min: float | None = None,
-    task_stuck_min: float = 15.0,
-    batch_wall_timeout_min: float | None = None,
-    task_timeout_min: int = 20,
-) -> tuple[int, int]:
-    """Blocks until every job in a batch reaches a terminal Slurm state.
+class ArrayBatch:
+    """State and polling for one in-flight Slurm job array (a "batch").
 
-    Polls submitit job states every ``BATCH_POLL_INTERVAL`` seconds and updates a
-    tqdm progress bar in real time.  This sequential, blocking approach ensures at
-    most one job array is in flight at a time, which prevents ``MaxJobCount``
-    saturation on the cluster (strategy borrowed from the Airflow Slurm provider).
+    Encapsulates the per-batch stuck-detection / backstop logic so that several
+    arrays can be polled concurrently by :func:`main` (pipelined submission) or
+    one at a time by :func:`wait_for_batch_completion`.
 
-    The progress bar tracks completed tasks and shows live counts of each Slurm
-    state (RUNNING, PENDING, FAILED, NODE_FAIL, …) in its postfix.
+    Call :meth:`poll` once per cycle (passing a monotonic timestamp).  It returns
+    ``True`` when the batch has reached a final state — every task terminal, or a
+    backstop force-finished it — at which point :attr:`completed` / :attr:`failed`
+    are set and the progress bar is closed.
 
     A batch is force-finished (cancelling the still non-terminal tasks) when any
     of these "no more progress possible" guards trips:
@@ -389,240 +382,305 @@ def wait_for_batch_completion(
       other 999 have already finished.
     * **Batch wall-time cap** (``batch_wall_timeout_min``) — a hard maximum wall
       time per batch, so no batch can stall the chain for arbitrarily long.
+    """
 
-    All three default to ``None`` (= disabled) and are set from sensible
-    values derived from ``--timeout-min`` in :func:`main`.
+    def __init__(
+        self,
+        jobs: list[submitit.Job],
+        chunk_idx: int,
+        total_chunks: int,
+        *,
+        stall_timeout_min: float | None = None,
+        task_stuck_min: float = 15.0,
+        batch_wall_timeout_min: float | None = None,
+        task_timeout_min: int = 20,
+        position: int = 0,
+        leave: bool = True,
+    ) -> None:
+        self.jobs = jobs
+        self.total = len(jobs)
+        self.chunk_idx = chunk_idx
+        self.total_chunks = total_chunks
+        self.stall_timeout_min = stall_timeout_min
+        self.task_stuck_min = task_stuck_min
+        self.batch_wall_timeout_min = batch_wall_timeout_min
+        self.task_timeout_min = task_timeout_min
+        self.position = position
+        self.completed = 0
+        self.failed = 0
+        self.done = False
+        now = time.monotonic()
+        # last_progress_time: reset whenever a task reaches a terminal state.
+        self.batch_start = now
+        self.last_progress_time = now
+        # Per-task (state, time-when-that-state-started); the clock resets on a
+        # state change so a task queued (PENDING) long then starting RUNNING is
+        # measured from its RUNNING start, not from when it first went non-terminal.
+        self.state_since: dict[submitit.Job, tuple[str, float]] = {}
+        self.prev_terminal = 0
+        self.pbar = tqdm(
+            total=self.total,
+            desc=f"Batch {chunk_idx}/{total_chunks}",
+            unit="task",
+            dynamic_ncols=True,
+            leave=leave,
+            position=position,
+            file=sys.stdout,
+        )
+        logger.debug(
+            "Waiting for batch %d/%d to complete (%d tasks)... "
+            "stall_timeout=%smin  task_stuck=%smin  wall_timeout=%smin  task_timeout=%dmin",
+            chunk_idx,
+            total_chunks,
+            self.total,
+            stall_timeout_min,
+            task_stuck_min,
+            batch_wall_timeout_min,
+            task_timeout_min,
+        )
+
+    def set_position(self, position: int) -> None:
+        """Move this batch's progress bar to a new terminal line (pipelining)."""
+        self.position = position
+        self.pbar.position = position
+        self.pbar.refresh()
+
+    def _finish(self) -> None:
+        """Mark the batch done and finalize its progress bar."""
+        self.done = True
+        self.pbar.refresh()
+        self.pbar.close()
+
+    def poll(self, now: float) -> bool:
+        """Advance one poll cycle; return True if the batch is now finished."""
+        # ── Collect per-task states via submitit (wraps squeue/sacct) ──
+        job_states: list[tuple[submitit.Job, str]] = []
+        states: dict[str, int] = {}
+        for job in self.jobs:
+            try:
+                state = job.state
+            except (
+                submitit.core.utils.FailedJobError,
+                AttributeError,
+                RuntimeError,
+            ) as e:
+                # Ces exceptions sont attendues dans le contexte submitit/Slurm
+                logger.debug("Job state query failed: %s: %s", type(e).__name__, e)
+                state = "UNKNOWN"
+            except (KeyboardInterrupt, SystemExit, OSError) as e:
+                # Attraper les autres exceptions mais avec log de warning
+                # et propagation des exceptions système critiques
+                if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                    raise
+                logger.warning(
+                    "Unexpected error in job state polling: %s", e, exc_info=True
+                )
+                state = "UNKNOWN"
+            job_states.append((job, state))
+            states[state] = states.get(state, 0) + 1
+
+        # ── Count terminal tasks ──
+        n_terminal = sum(1 for _, s in job_states if is_terminal_state(s))
+
+        # ── Per-task stuck detection ──
+        # Track how long each non-terminal task has been in its *current* state
+        # (resetting the clock on state change) and cancel any task whose state
+        # has exceeded its state-aware threshold. Works regardless of whether the
+        # rest of the batch is still progressing.
+        stuck_jobs: list[submitit.Job] = []
+        for job, state in job_states:
+            if is_terminal_state(state):
+                self.state_since.pop(job, None)
+                continue
+            prev = self.state_since.get(job)
+            if prev is None or prev[0] != state:
+                # New task, or just changed state -> (re)start its clock.
+                self.state_since[job] = (state, now)
+                continue  # don't judge it until the next poll (fair clock)
+            _, since = self.state_since[job]
+            stuck_min = (now - since) / 60.0
+            threshold = stuck_threshold_minutes(
+                state, self.task_timeout_min, self.task_stuck_min
+            )
+            if threshold is not None and stuck_min >= threshold:
+                stuck_jobs.append(job)
+                logger.warning(
+                    "Batch %d/%d: task %s stuck in %s for %.0f min "
+                    "(threshold %.0f min) — cancelling",
+                    self.chunk_idx,
+                    self.total_chunks,
+                    job.job_id,
+                    state,
+                    stuck_min,
+                    threshold,
+                )
+        if stuck_jobs:
+            job_ids = sorted(j.job_id for j in stuck_jobs)
+            # A submitit array job_id is "base_task" (e.g. 528266_108); cancelling
+            # the base id would scancel the whole array, not just the stuck tasks.
+            subprocess.run(["scancel", *job_ids], check=False)
+            # Drop them from tracking so they don't re-trigger; they'll show as
+            # CANCELLED on the next poll.
+            for j in stuck_jobs:
+                self.state_since.pop(j, None)
+
+        # ── Advance progress bar / reset no-progress clock ──
+        delta = n_terminal - self.prev_terminal
+        if delta > 0:
+            self.pbar.update(delta)
+            self.last_progress_time = now
+
+        # ── No-progress backstop ──
+        stalled_min = (now - self.last_progress_time) / 60.0
+        # ── Batch wall-time cap ──
+        wall_min = (now - self.batch_start) / 60.0
+
+        if (
+            self.stall_timeout_min is not None
+            and self.stall_timeout_min > 0
+            and stalled_min >= self.stall_timeout_min
+        ):
+            self.completed, self.failed = _force_finish_batch(
+                job_states,
+                states,
+                self.total,
+                self.pbar,
+                self.chunk_idx,
+                self.total_chunks,
+                f"stalled for {stalled_min:.0f} min with no progress "
+                f"(threshold {self.stall_timeout_min:.0f} min)",
+            )
+            self._finish()
+            return True
+
+        if (
+            self.batch_wall_timeout_min is not None
+            and self.batch_wall_timeout_min > 0
+            and wall_min >= self.batch_wall_timeout_min
+        ):
+            self.completed, self.failed = _force_finish_batch(
+                job_states,
+                states,
+                self.total,
+                self.pbar,
+                self.chunk_idx,
+                self.total_chunks,
+                f"exceeded batch wall-time cap of "
+                f"{self.batch_wall_timeout_min:.0f} min (now at {wall_min:.0f} min)",
+            )
+            self._finish()
+            return True
+
+        self.prev_terminal = n_terminal
+
+        # ── Build a compact postfix showing every non-zero state ──
+        # Prioritise actionable states first (RUNNING, PENDING) then failures, so
+        # the most important info is never truncated.
+        state_order = [
+            "RUNNING",
+            "PENDING",
+            "COMPLETED",
+            "FAILED",
+            "NODE_FAIL",
+            "TIMEOUT",
+            "CANCELLED",
+            "UNKNOWN",
+        ]
+        postfix_parts: dict[str, object] = {}
+        for s in state_order:
+            if states.get(s, 0):
+                postfix_parts[s.lower()] = states[s]
+        # Append any remaining states not in the priority list.
+        for s, n in states.items():
+            if s not in state_order and n:
+                postfix_parts[s.lower()] = n
+        # Show countdowns when the respective backstop is enabled.
+        if self.stall_timeout_min is not None and self.stall_timeout_min > 0:
+            postfix_parts["stall"] = (
+                f"{int(stalled_min)}/{int(self.stall_timeout_min)}min"
+            )
+        if self.batch_wall_timeout_min is not None and self.batch_wall_timeout_min > 0:
+            postfix_parts["wall"] = (
+                f"{int(wall_min)}/{int(self.batch_wall_timeout_min)}min"
+            )
+        self.pbar.set_postfix(postfix_parts)
+
+        parts = [f"{s}={n}" for s, n in sorted(states.items())]
+        logger.debug(
+            "Batch %d/%d — total=%d  terminal=%d  [%s]  stalled=%.0fmin  wall=%.0fmin",
+            self.chunk_idx,
+            self.total_chunks,
+            self.total,
+            n_terminal,
+            "  ".join(parts),
+            stalled_min,
+            wall_min,
+        )
+
+        if n_terminal >= self.total:
+            self.completed = states.get("COMPLETED", 0)
+            self.failed = self.total - self.completed
+            self.pbar.set_postfix(
+                {"completed": self.completed, "failed": self.failed},
+                refresh=True,
+            )
+            logger.info(
+                "Batch %d/%d finished — completed=%d  failed=%d",
+                self.chunk_idx,
+                self.total_chunks,
+                self.completed,
+                self.failed,
+            )
+            self._finish()
+            return True
+
+        return False
+
+
+def wait_for_batch_completion(
+    jobs: list[submitit.Job],
+    chunk_idx: int,
+    total_chunks: int,
+    stall_timeout_min: float | None = None,
+    task_stuck_min: float = 15.0,
+    batch_wall_timeout_min: float | None = None,
+    task_timeout_min: int = 20,
+) -> tuple[int, int]:
+    """Blocks until every job in a batch reaches a terminal Slurm state.
+
+    Thin blocking wrapper over :class:`ArrayBatch`: polls every
+    ``BATCH_POLL_INTERVAL`` seconds until the batch finishes, showing a live tqdm
+    progress bar.  Used for the sequential (one array at a time) path; the
+    pipelined path in :func:`main` polls several :class:`ArrayBatch` concurrently.
+
+    See :class:`ArrayBatch` for the stuck-task / backstop semantics.
 
     Args:
         jobs (list[submitit.Job]): Job handles returned by ``map_array()``.
         chunk_idx (int): 1-based index of this chunk (for logging).
         total_chunks (int): Total number of chunks (for logging).
-        stall_timeout_min (float | None): Minutes without progress before
-            cancelling all remaining tasks. ``None`` (or ``0``) = disabled.
-        task_stuck_min (float): Minutes a task may sit in a hold/transient state
-            before it is cancelled individually. 0 = disabled.
-        batch_wall_timeout_min (float | None): Hard cap on total batch wall time
-            in minutes. ``None`` (or ``0``) = disabled.
-        task_timeout_min (int): The ``--timeout-min`` value; used as the bound for
-            ``RUNNING`` tasks and to sanity-check the backstop default.
+        stall_timeout_min (float | None): No-progress backstop (minutes).
+            ``None`` (or ``0``) = disabled.
+        task_stuck_min (float): Per-task stuck timeout for hold/transient states.
+        batch_wall_timeout_min (float | None): Hard cap on batch wall time.
+        task_timeout_min (int): The ``--timeout-min`` value (bounds RUNNING tasks).
 
     Returns:
         tuple[int, int]: ``(completed, failed)`` task counts.
     """
-    total = len(jobs)
-    now = time.monotonic()
-    batch_start = now
-    # last_progress_time: reset whenever a task reaches a terminal state.
-    last_progress_time = now
-    # Per-task (state, timestamp-when-that-state-started) for per-task stuck
-    # detection. The clock resets whenever a task changes state, so e.g. a task
-    # queued (PENDING) for a long time then starting RUNNING is measured from its
-    # RUNNING start, not from when it first became non-terminal.
-    state_since: dict[submitit.Job, tuple[str, float]] = {}
-
-    logger.debug(
-        "Waiting for batch %d/%d to complete (%d tasks)... "
-        "stall_timeout=%smin  task_stuck=%smin  wall_timeout=%smin  task_timeout=%dmin",
+    batch = ArrayBatch(
+        jobs,
         chunk_idx,
         total_chunks,
-        total,
-        stall_timeout_min,
-        task_stuck_min,
-        batch_wall_timeout_min,
-        task_timeout_min,
+        stall_timeout_min=stall_timeout_min,
+        task_stuck_min=task_stuck_min,
+        batch_wall_timeout_min=batch_wall_timeout_min,
+        task_timeout_min=task_timeout_min,
     )
-
-    with tqdm(
-        total=total,
-        desc=f"Batch {chunk_idx}/{total_chunks}",
-        unit="task",
-        dynamic_ncols=True,
-        leave=True,
-        file=sys.stdout,
-    ) as pbar:
-        prev_terminal = 0
-
-        while True:
-            time.sleep(BATCH_POLL_INTERVAL)
-            now = time.monotonic()
-
-            # ── Collect per-task states via submitit (wraps squeue/sacct) ──
-            job_states: list[tuple[submitit.Job, str]] = []
-            states: dict[str, int] = {}
-            for job in jobs:
-                try:
-                    state = job.state
-                except (
-                    submitit.core.utils.FailedJobError,
-                    AttributeError,
-                    RuntimeError,
-                ) as e:
-                    # Ces exceptions sont attendues dans le contexte submitit/Slurm
-                    logger.debug("Job state query failed: %s: %s", type(e).__name__, e)
-                    state = "UNKNOWN"
-                except (KeyboardInterrupt, SystemExit, OSError) as e:
-                    # Attraper les autres exceptions mais avec log de warning
-                    # et propagation des exceptions système critiques
-                    if isinstance(e, (KeyboardInterrupt, SystemExit)):
-                        raise
-                    logger.warning(
-                        "Unexpected error in job state polling: %s", e, exc_info=True
-                    )
-                    state = "UNKNOWN"
-                job_states.append((job, state))
-                states[state] = states.get(state, 0) + 1
-
-            # ── Count terminal tasks ──
-            n_terminal = sum(1 for _, s in job_states if is_terminal_state(s))
-
-            # ── Per-task stuck detection (fixes #2 and #3) ──
-            # Track how long each non-terminal task has been in its *current*
-            # state (resetting the clock on state change) and cancel any task
-            # whose state has exceeded its state-aware threshold. This works
-            # regardless of whether the rest of the batch is still progressing.
-            stuck_jobs: list[submitit.Job] = []
-            for job, state in job_states:
-                if is_terminal_state(state):
-                    state_since.pop(job, None)
-                    continue
-                prev = state_since.get(job)
-                if prev is None or prev[0] != state:
-                    # New task, or just changed state -> (re)start its clock.
-                    state_since[job] = (state, now)
-                    continue  # don't judge it until the next poll (fair clock)
-                _, since = state_since[job]
-                stuck_min = (now - since) / 60.0
-                threshold = stuck_threshold_minutes(
-                    state, task_timeout_min, task_stuck_min
-                )
-                if threshold is not None and stuck_min >= threshold:
-                    stuck_jobs.append(job)
-                    logger.warning(
-                        "Batch %d/%d: task %s stuck in %s for %.0f min "
-                        "(threshold %.0f min) — cancelling",
-                        chunk_idx,
-                        total_chunks,
-                        job.job_id,
-                        state,
-                        stuck_min,
-                        threshold,
-                    )
-            if stuck_jobs:
-                job_ids = sorted(j.job_id for j in stuck_jobs)
-                # A submitit array job_id is "base_task" (e.g. 528266_108);
-                # cancelling the base id would scancel the whole array, not just
-                # the stuck tasks.
-                subprocess.run(["scancel", *job_ids], check=False)
-                # Drop them from tracking so they don't re-trigger; they'll show
-                # as CANCELLED on the next poll.
-                for j in stuck_jobs:
-                    state_since.pop(j, None)
-
-            # ── Advance progress bar / reset no-progress clock ──
-            delta = n_terminal - prev_terminal
-            if delta > 0:
-                pbar.update(delta)
-                last_progress_time = now
-
-            # ── No-progress backstop (fix #1) ──
-            stalled_min = (now - last_progress_time) / 60.0
-            # ── Batch wall-time cap (fix #4) ──
-            wall_min = (now - batch_start) / 60.0
-
-            if (
-                stall_timeout_min is not None
-                and stall_timeout_min > 0
-                and stalled_min >= stall_timeout_min
-            ):
-                return _force_finish_batch(
-                    job_states,
-                    states,
-                    total,
-                    pbar,
-                    chunk_idx,
-                    total_chunks,
-                    f"stalled for {stalled_min:.0f} min with no progress "
-                    f"(threshold {stall_timeout_min:.0f} min)",
-                )
-
-            if (
-                batch_wall_timeout_min is not None
-                and batch_wall_timeout_min > 0
-                and wall_min >= batch_wall_timeout_min
-            ):
-                return _force_finish_batch(
-                    job_states,
-                    states,
-                    total,
-                    pbar,
-                    chunk_idx,
-                    total_chunks,
-                    f"exceeded batch wall-time cap of "
-                    f"{batch_wall_timeout_min:.0f} min (now at {wall_min:.0f} min)",
-                )
-
-            prev_terminal = n_terminal
-
-            # ── Build a compact postfix showing every non-zero state ──
-            # Prioritise actionable states first (RUNNING, PENDING) then
-            # failures, so the most important info is never truncated.
-            state_order = [
-                "RUNNING",
-                "PENDING",
-                "COMPLETED",
-                "FAILED",
-                "NODE_FAIL",
-                "TIMEOUT",
-                "CANCELLED",
-                "UNKNOWN",
-            ]
-            postfix_parts: dict[str, object] = {}
-            for s in state_order:
-                if states.get(s, 0):
-                    postfix_parts[s.lower()] = states[s]
-            # Append any remaining states not in the priority list.
-            for s, n in states.items():
-                if s not in state_order and n:
-                    postfix_parts[s.lower()] = n
-            # Show stall countdown when the no-progress backstop is enabled.
-            if stall_timeout_min is not None and stall_timeout_min > 0:
-                postfix_parts["stall"] = (
-                    f"{int(stalled_min)}/{int(stall_timeout_min)}min"
-                )
-            # Show wall-time countdown when the wall cap is enabled.
-            if batch_wall_timeout_min is not None and batch_wall_timeout_min > 0:
-                postfix_parts["wall"] = (
-                    f"{int(wall_min)}/{int(batch_wall_timeout_min)}min"
-                )
-            pbar.set_postfix(postfix_parts)
-
-            parts = [f"{s}={n}" for s, n in sorted(states.items())]
-            logger.debug(
-                "Batch %d/%d — total=%d  terminal=%d  [%s]  stalled=%.0fmin  wall=%.0fmin",
-                chunk_idx,
-                total_chunks,
-                total,
-                n_terminal,
-                "  ".join(parts),
-                stalled_min,
-                wall_min,
-            )
-
-            if n_terminal >= total:
-                completed = states.get("COMPLETED", 0)
-                failed = total - completed
-                pbar.set_postfix(
-                    {"completed": completed, "failed": failed},
-                    refresh=True,
-                )
-                logger.info(
-                    "Batch %d/%d finished — completed=%d  failed=%d",
-                    chunk_idx,
-                    total_chunks,
-                    completed,
-                    failed,
-                )
-                return completed, failed
+    while True:
+        time.sleep(BATCH_POLL_INTERVAL)
+        if batch.poll(time.monotonic()):
+            return batch.completed, batch.failed
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +755,18 @@ def parser_args() -> argparse.Namespace:
         help="Stop submitting further batches if any task in the current batch fails",
     )
     parser.add_argument(
+        "--max-arrays-inflight",
+        type=int,
+        default=2,
+        help=(
+            "Maximum number of job arrays (batches) kept in flight at the same "
+            "time (pipelined submission). Each array is one Slurm job, so this "
+            "must stay under the cluster's MaxJobCount. Overall concurrency = "
+            "--max-arrays-inflight x --slurm-array-parallelism. "
+            "1 = the previous strictly-sequential behavior. Default: 2."
+        ),
+    )
+    parser.add_argument(
         "--batch-stall-timeout-min",
         type=float,
         default=None,
@@ -738,21 +808,27 @@ def parser_args() -> argparse.Namespace:
 
 
 def main(args: argparse.Namespace) -> None:
-    """Configures and submits job array chunks to the Slurm cluster.
+    """Configures and submits job array chunks to the Slurm cluster (pipelined).
 
-    Strategy (inspired by the Airflow Slurm provider):
-      1. Split the input listing into chunks of ``CHUNK_SIZE`` (< MaxArraySize).
-      2. Submit the first chunk as a Slurm job array via submitit.
-      3. **Block** until every task in that chunk reaches a terminal state,
-         showing a live tqdm progress bar.
-      4. Only then submit the next chunk.
+    Strategy:
+      1. Split the input listing into chunks of ``CHUNK_SIZE`` (<= 1000 = the
+         cluster ``MaxArraySize``).
+      2. Submit up to ``--max-arrays-inflight`` chunks (each a Slurm job array)
+         and keep polling them all.
+      3. As soon as an array reaches a terminal state (or is force-finished by
+         the stuck-task backstops), submit the next pending chunk in its place.
+      4. Repeat until every chunk is submitted and all in-flight arrays have
+         finished.
 
-    This sequential, one-array-at-a-time approach ensures the cluster's
-    ``MaxJobCount`` is never saturated, at the cost of lower parallelism
-    compared to submitting all chunks simultaneously.
+    Keeping several arrays in flight (pipelining) means the cluster is never
+    idle waiting for an entire array to drain before the next one starts, while
+    the number of jobs in the queue stays bounded by ``--max-arrays-inflight``
+    (keep it under the cluster ``MaxJobCount``).  Overall concurrency is
+    ``--max-arrays-inflight x --slurm-array-parallelism``.  Each array keeps the
+    Phase-1 stuck-task protection (see :class:`ArrayBatch`).
 
-    Each submission is retried up to ``SUBMIT_MAX_RETRIES`` times with
-    linear backoff to handle transient sbatch failures.
+    Each submission is retried up to ``SUBMIT_MAX_RETRIES`` times with linear
+    backoff to handle transient sbatch failures.
 
     Args:
         args (argparse.Namespace): Parsed CLI arguments (paths + Slurm config).
@@ -766,7 +842,8 @@ def main(args: argparse.Namespace) -> None:
     logger.info("Submitit logs will be stored in: %s", output_dir_with_date)
     logger.info("Bash script to execute: %s", args.bash_slurm_exec)
     logger.info(
-        "Submission strategy: sequential batches (1 array at a time, blocking poll)"
+        "Submission strategy: pipelined — up to %d job array(s) in flight at once",
+        args.max_arrays_inflight,
     )
     mem_gb = parse_memory_to_gb(args.mem)
     logger.info("Parsed memory argument: %s -> %.2f GB", args.mem, mem_gb)
@@ -826,8 +903,68 @@ def main(args: argparse.Namespace) -> None:
         args.timeout_min,
     )
 
+    # Guard against a non-positive pipeline depth (0 would make the fill loop never
+    # submit and the poll loop spin forever).
+    max_inflight = max(1, int(args.max_arrays_inflight))
+
+    # Precompute the chunks (each <= CHUNK_SIZE) that will be submitted.
+    chunks = [
+        array_inputs[i : i + CHUNK_SIZE]
+        for i in range(0, len(array_inputs), CHUNK_SIZE)
+    ]
+    next_chunk_idx = 0
+    in_flight: list[ArrayBatch] = []
     global_completed = 0
     global_failed = 0
+    # --fail-fast: once set, no more arrays are submitted; in-flight ones drain.
+    fail_fast_stop = False
+
+    def _submit_next() -> bool:
+        """Submit the next pending chunk (if any) and add it to in_flight.
+
+        Returns False if there are no more chunks to submit.
+        """
+        nonlocal next_chunk_idx
+        if next_chunk_idx >= len(chunks):
+            return False
+        chunk_idx = next_chunk_idx
+        chunk = chunks[next_chunk_idx]
+        next_chunk_idx += 1
+        logger.debug(
+            "=== Submitting batch %d/%d — tasks %d to %d (%d tasks) ===",
+            chunk_idx + 1,
+            total_chunks,
+            chunk_idx * CHUNK_SIZE,
+            chunk_idx * CHUNK_SIZE + len(chunk) - 1,
+            len(chunk),
+        )
+        jobs = submit_chunk_with_retry(
+            executor, process_func, chunk, chunk_idx + 1, total_chunks
+        )
+        # Per-chunk wall cap. A RUNNING task can't exceed --timeout-min, so the
+        # theoretical max healthy duration is `waves * timeout_min` where
+        # waves = ceil(chunk_size / parallelism). We use 2x that as a loose
+        # safety net (won't falsely kill a healthy batch, but bounds a
+        # pathological "creeping progress forever" case). The primary protection
+        # is the per-task + no-progress logic, not this cap.
+        waves = math.ceil(len(chunk) / args.slurm_array_parallelism)
+        batch_wall = (
+            args.batch_wall_timeout_min
+            if args.batch_wall_timeout_min is not None
+            else 2.0 * waves * (args.timeout_min + RUNNING_GRACE_MIN)
+        )
+        in_flight.append(
+            ArrayBatch(
+                jobs,
+                chunk_idx + 1,
+                total_chunks,
+                stall_timeout_min=stall_timeout_min,
+                task_stuck_min=task_stuck_min,
+                batch_wall_timeout_min=batch_wall,
+                task_timeout_min=args.timeout_min,
+            )
+        )
+        return True
 
     # Outer progress bar tracks batch-level progress across all chunks.
     with tqdm(
@@ -838,67 +975,64 @@ def main(args: argparse.Namespace) -> None:
         leave=True,
         file=sys.stdout,
     ) as outer_pbar:
-        for chunk_idx, i in enumerate(range(0, len(array_inputs), CHUNK_SIZE), start=1):
-            chunk = array_inputs[i : i + CHUNK_SIZE]
-            logger.debug(
-                "=== Batch %d/%d — tasks %d to %d (%d tasks) ===",
-                chunk_idx,
-                total_chunks,
-                i,
-                i + len(chunk) - 1,
-                len(chunk),
-            )
+        # Fill the pipeline up to the max number of in-flight arrays.
+        while len(in_flight) < max_inflight and _submit_next():
+            pass
 
-            # Submit with retry on transient sbatch failures.
-            jobs = submit_chunk_with_retry(
-                executor, process_func, chunk, chunk_idx, total_chunks
-            )
+        # Keep progress-bar line positions stable (0..N-1).
+        for i, b in enumerate(in_flight):
+            b.set_position(i)
 
-            # Per-chunk wall cap. A RUNNING task can't exceed --timeout-min, so the
-            # theoretical max healthy duration is `waves * timeout_min` where
-            # waves = ceil(chunk_size / parallelism). We use 2x that as a loose
-            # safety net (won't falsely kill a healthy batch, but bounds a
-            # pathological "creeping progress forever" case). The primary
-            # protection is the per-task + no-progress logic, not this cap.
-            waves = math.ceil(len(chunk) / args.slurm_array_parallelism)
-            batch_wall = (
-                args.batch_wall_timeout_min
-                if args.batch_wall_timeout_min is not None
-                else 2.0 * waves * (args.timeout_min + RUNNING_GRACE_MIN)
-            )
+        # Main poll loop: poll all in-flight arrays, remove the finished ones
+        # (freeing a slot), and submit the next pending chunk into that slot.
+        # With --fail-fast, stop submitting once a batch reports failures, but
+        # still drain the arrays already in flight.
+        while in_flight or (not fail_fast_stop and next_chunk_idx < len(chunks)):
+            for b in in_flight:
+                b.poll(time.monotonic())
 
-            # Block until this batch is fully done before submitting the next one.
-            # This is the key throttling mechanism: at most one array in flight.
-            completed, failed = wait_for_batch_completion(
-                jobs,
-                chunk_idx,
-                total_chunks,
-                stall_timeout_min=stall_timeout_min,
-                task_stuck_min=task_stuck_min,
-                batch_wall_timeout_min=batch_wall,
-                task_timeout_min=args.timeout_min,
-            )
-            global_completed += completed
-            global_failed += failed
-
-            outer_pbar.update(1)
-            outer_pbar.set_postfix(
-                {
-                    "completed": global_completed,
-                    "failed": global_failed,
-                }
-            )
-
-            if failed and args.fail_fast:
-                logger.error(
-                    "Batch %d/%d had %d failure(s) and --fail-fast is set. "
-                    "Aborting remaining %d batches.",
-                    chunk_idx,
-                    total_chunks,
-                    failed,
-                    total_chunks - chunk_idx,
+            # Remove finished arrays (releasing their slot for the next chunk).
+            newly_done = [b for b in in_flight if b.done]
+            if newly_done:
+                for b in newly_done:
+                    in_flight.remove(b)
+                    global_completed += b.completed
+                    global_failed += b.failed
+                    outer_pbar.update(1)
+                outer_pbar.set_postfix(
+                    {
+                        "completed": global_completed,
+                        "failed": global_failed,
+                    }
                 )
-                break
+                if args.fail_fast and any(b.failed for b in newly_done):
+                    failed_batch = next(b for b in newly_done if b.failed)
+                    fail_fast_stop = True
+                    logger.error(
+                        "Batch %d/%d had %d failure(s) and --fail-fast is set. "
+                        "Stopping submission of the remaining %d batch(es); "
+                        "draining the %d in-flight.",
+                        failed_batch.chunk_idx,
+                        failed_batch.total_chunks,
+                        failed_batch.failed,
+                        len(chunks) - next_chunk_idx,
+                        len(in_flight),
+                    )
+
+            # Refill the pipeline while there are free slots and pending chunks.
+            if not fail_fast_stop:
+                while (
+                    len(in_flight) < max_inflight
+                    and next_chunk_idx < len(chunks)
+                    and _submit_next()
+                ):
+                    pass
+
+            # Reposition bars after removals/additions.
+            for i, b in enumerate(in_flight):
+                b.set_position(i)
+
+            time.sleep(BATCH_POLL_INTERVAL)
 
     logger.info(
         "All done — total_submitted=%d  completed=%d  failed=%d  across %d batch(es).",
