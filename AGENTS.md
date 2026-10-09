@@ -84,27 +84,28 @@ Planned work for the submission engine. Ordered: do Phase 1 before Phase 2.
 
 ### Phase 1 — stuck-task detection (fixes the whole-run block)
 
-Today a single non-terminal task (e.g. `HELD` / `REQUEUE_HOLD`) blocks the entire
-run: `wait_for_batch_completion()` (`blaster.py`) waits for **all** 1000 tasks in a
-batch to be terminal before `main()` submits the next batch, and `HELD`/`PENDING`/
-`RUNNING` are not in `TERMINAL_STATES`. Implement:
+Today a single non-terminal task (e.g. `HELD` / `REQUEUE_HOLD`) blocks the
+entire run: `wait_for_batch_completion()` (`blaster.py`) waits for **all** 1000
+tasks in a batch to be terminal before `main()` submits the next batch, and
+`HELD`/`PENDING`/ `RUNNING` are not in `TERMINAL_STATES`. Implement:
 
 1. **Stall detection on by default** — give `--batch-stall-timeout-min` a sane
    non-zero default (today `0` = "wait forever" is the default).
-2. **Per-task stuck detection** — track each task's own time in a non-terminal state
-   and cancel it after a threshold, regardless of whether the rest of the batch is
-   still making progress (today the stall clock resets on *any* progress).
+2. **Per-task stuck detection** — track each task's own time in a non-terminal
+   state and cancel it after a threshold, regardless of whether the rest of the
+   batch is still making progress (today the stall clock resets on _any_
+   progress).
 3. **State-aware timeouts** — short timeout for `PENDING`/`HELD`/`REQUEUE_HOLD`
-   (unlikely to ever run); long/no timeout for `RUNNING` (legitimately long tasks).
-   A requeued-held task should be cancelled quickly, not waited on.
+   (unlikely to ever run); long/no timeout for `RUNNING` (legitimately long
+   tasks). A requeued-held task should be cancelled quickly, not waited on.
 4. **Bound batch wall-time** — a max wall-time per batch that force-finishes the
    batch and moves on, so no single batch can stall the chain.
 
 ### Phase 2 — pipelined arrays (replace the blocking loop)
 
-Replace the submit → block → submit loop in `main()` with a pipelined model: keep up
-to **K arrays in flight**, poll all of them, and submit the next as a slot frees.
-Concurrency = `K × --slurm-array-parallelism`; must stay under `MaxArraySize`
-(≤ 1000 tasks/array) and `MaxJobCount` (K jobs in flight). Keep native submitit
-**arrays** — do **not** switch to per-task individual jobs (sbatch storm, shadow
-scheduler, `MaxJobCount`).
+Replace the submit → block → submit loop in `main()` with a pipelined model:
+keep up to **K arrays in flight**, poll all of them, and submit the next as a
+slot frees. Concurrency = `K × --slurm-array-parallelism`; must stay under
+`MaxArraySize` (≤ 1000 tasks/array) and `MaxJobCount` (K jobs in flight). Keep
+native submitit **arrays** — do **not** switch to per-task individual jobs
+(sbatch storm, shadow scheduler, `MaxJobCount`).
