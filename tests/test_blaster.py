@@ -11,6 +11,7 @@ import pytest
 from turboblast.blaster import (
     ArrayBatch,
     _force_finish_batch,
+    _query_state,
     _SacctBypassLogFilter,
     main,
     parse_memory_to_gb,
@@ -696,6 +697,26 @@ class TestBlindGuard:
             postfix = batch.pbar.set_postfix.call_args[0][0]
             assert postfix["blind"] == "0/5min"
             batch.pbar.close()
+
+
+class TestQueryState:
+    """_query_state force-reads a job state, falling back to UNKNOWN on failure."""
+
+    def test_returns_state_when_available(self):
+        job = MagicMock()
+        job.get_info = MagicMock(return_value={"State": "RUNNING"})
+        assert _query_state(job) == "RUNNING"
+
+    def test_unknown_when_no_state_key(self):
+        job = MagicMock()
+        job.get_info = MagicMock(return_value={})
+        assert _query_state(job) == "UNKNOWN"
+
+    @pytest.mark.parametrize("exc", [RuntimeError("boom"), OSError("slurm gone")])
+    def test_unknown_when_read_raises(self, exc):
+        job = MagicMock()
+        job.get_info = MagicMock(side_effect=exc)
+        assert _query_state(job) == "UNKNOWN"
 
 
 class TestForceFinishBlind:
