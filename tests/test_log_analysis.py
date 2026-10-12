@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -158,22 +159,28 @@ class TestParserArgs:
 
 
 class TestEntrypoint:
-    def test_missing_dir_exits(self):
+    def test_happy_path_logs_report(self, tmp_path, caplog):
+        (tmp_path / "task_a.out").write_text(
+            "completed successfully\n", encoding="utf-8"
+        )
         with (
+            caplog.at_level(logging.INFO, logger="turboblast.log_analysis"),
+            patch("sys.argv", ["slurm-logs", str(tmp_path)]),
+        ):
+            entrypoint()
+        assert "ANALYZING SUBMITIT LOGS" in caplog.text
+        assert "SUCCESSFUL TASKS" in caplog.text
+        assert "Total Tasks Scanned: 1" in caplog.text
+        # the report is emitted at INFO level (no print)
+        assert any(r.levelno == logging.INFO for r in caplog.records)
+
+    def test_missing_dir_logs_error(self, caplog):
+        with (
+            caplog.at_level(logging.ERROR, logger="turboblast.log_analysis"),
             patch("sys.argv", ["slurm-logs", "/does/not/exist"]),
             pytest.raises(SystemExit) as exc_info,
         ):
             entrypoint()
         assert exc_info.value.code == 1
-
-    def test_happy_path_prints_report(self, tmp_path, capsys):
-        (tmp_path / "task_a.out").write_text(
-            "completed successfully\n", encoding="utf-8"
-        )
-        with patch("sys.argv", ["slurm-logs", str(tmp_path)]):
-            entrypoint()
-        out = capsys.readouterr().out
-        assert "ANALYZING SUBMITIT LOGS" in out
-        assert "SUCCESSFUL TASKS" in out
-        # ensure stdout write was used (no print), captured by capsys
-        assert "Total Tasks Scanned: 1" in out
+        assert "does not exist" in caplog.text
+        assert caplog.records[-1].levelno == logging.ERROR
