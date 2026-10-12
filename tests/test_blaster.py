@@ -1,4 +1,5 @@
 import argparse
+import logging
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -9,6 +10,8 @@ import pytest
 
 from turboblast.blaster import (
     ArrayBatch,
+    _force_finish_batch,
+    _SacctBypassLogFilter,
     main,
     parse_memory_to_gb,
     parser_args,
@@ -579,6 +582,199 @@ class TestPerTaskStuckDetection:
         assert mock_run.call_args[0][0] == ["scancel", "8001"]
         assert completed == 0
         assert failed == 1
+
+
+# ─── Blind state-source guard (issue #20) ─────────────────────────────────────
+
+
+class TestBlindGuard:
+    """When every task reads UNKNOWN the state source (sacct/slurmdbd) is down:
+    backstops must pause (no blind-cancel) and a bounded blind clock eventually
+    gives up *without* cancelling."""
+
+    def test_blind_outage_never_blind_cancels(self):
+        """Issue #20 regression: 1000 tasks all UNKNOWN for a long time. The
+        old code's 40-min stall backstop would scancel all of them; now the
+        batch is given up WITHOUT any scancel."""
+        jobs = [_make_job(f"100_{i}", ["UNKNOWN"] * 50) for i in range(3)]
+
+        # batch_start=0, then polls every 60s from 60..1260s (21 blind cycles).
+        # stall cap 40min would never be reached (clocks paused while blind);
+        # blind cap 20min (=1200s) trips at poll now=1260s (blind since 60s).
+        clock = _FakeClock([0.0] + [60.0 * i for i in range(1, 22)])
+        with (
+            patch("turboblast.blaster.time.sleep"),
+            patch("turboblast.blaster.tqdm"),
+            patch("turboblast.blaster.subprocess.run") as mock_run,
+            patch("time.monotonic", clock),
+        ):
+            completed, failed = wait_for_batch_completion(
+                jobs,
+                1,
+                1,
+                stall_timeout_min=40,
+                task_stuck_min=15,
+                batch_wall_timeout_min=0,
+                blind_timeout_min=20,
+            )
+
+        # Nothing cancelled — the tasks may well be running fine.
+        assert mock_run.call_count == 0
+        # Given up: all unreadable tasks count as failed (fail-fast still reacts).
+        assert (completed, failed) == (0, 3)
+
+    def test_blind_recovers_and_completes_normally(self):
+        """A transient outage: the batch is blind for a few cycles, the state
+        source recovers, and the tasks then complete for real (no scancel, all
+        counted as completed)."""
+        jobs = [
+            _make_job(f"200_{i}", ["UNKNOWN", "UNKNOWN", "COMPLETED", "COMPLETED"])
+            for i in range(2)
+        ]
+
+        # batch_start=0; poll1=60s & poll2=120s blind; poll3=180s recovered and
+        # all COMPLETED.
+        clock = _FakeClock([0.0, 60.0, 120.0, 180.0])
+        with (
+            patch("turboblast.blaster.time.sleep"),
+            patch("turboblast.blaster.tqdm"),
+            patch("turboblast.blaster.subprocess.run") as mock_run,
+            patch("time.monotonic", clock),
+        ):
+            completed, failed = wait_for_batch_completion(
+                jobs,
+                1,
+                1,
+                stall_timeout_min=1,  # would have tripped long ago if not paused
+                task_stuck_min=15,
+                batch_wall_timeout_min=0,
+                blind_timeout_min=30,
+            )
+
+        assert mock_run.call_count == 0
+        assert (completed, failed) == (2, 0)
+
+    def test_partial_unknown_is_not_blind(self):
+        """Only *all* UNKNOWN means the state source is down. A few UNKNOWN tasks
+        among readable ones is normal: the backstops still apply (here the
+        no-progress cap cancels the unknown one)."""
+        job1 = _make_job("300_0", ["UNKNOWN", "UNKNOWN"])
+        job2 = _make_job("300_1", ["COMPLETED", "COMPLETED"])
+        jobs = [job1, job2]
+
+        # batch_start=0, poll1=30s (job2 done -> progress), poll2=150s (2 min with
+        # no progress >= 1 min cap -> cancel the unknown job1).
+        clock = _FakeClock([0.0, 30.0, 150.0])
+        with (
+            patch("turboblast.blaster.time.sleep"),
+            patch("turboblast.blaster.tqdm"),
+            patch("turboblast.blaster.subprocess.run") as mock_run,
+            patch("time.monotonic", clock),
+        ):
+            completed, failed = wait_for_batch_completion(
+                jobs,
+                1,
+                1,
+                stall_timeout_min=1,
+                task_stuck_min=15,
+                batch_wall_timeout_min=0,
+                blind_timeout_min=30,
+            )
+
+        # The single unknown task is cancelled by the (still-active) backstop.
+        assert mock_run.call_count == 1
+        assert mock_run.call_args[0][0] == ["scancel", "300_0"]
+        assert (completed, failed) == (1, 1)
+
+    def test_blind_clock_is_persisted_and_postfix_shown(self):
+        """While blind, the progress-bar postfix carries a blind=<n>/<cap>min."""
+        jobs = [_make_job("400_0", ["UNKNOWN", "UNKNOWN"])]
+        with patch("turboblast.blaster.tqdm"):
+            batch = ArrayBatch(jobs, 1, 1, stall_timeout_min=10, blind_timeout_min=5)
+            assert batch.poll(0.0) is False
+            # postfix includes a blind countdown
+            postfix = batch.pbar.set_postfix.call_args[0][0]
+            assert postfix["blind"] == "0/5min"
+            batch.pbar.close()
+
+
+class TestForceFinishBlind:
+    """_force_finish_batch must label and re-query UNKNOWN (blind) cancellations."""
+
+    @staticmethod
+    def _job(job_id: str, state: str) -> MagicMock:
+        job = MagicMock()
+        job.job_id = job_id
+        job.get_info = MagicMock(return_value={"State": state} if state else {})
+        return job
+
+    def test_blind_cancellation_flagged_and_requeried(self, caplog):
+        job = self._job("5000_1", "CANCELLED")  # re-query after sleep
+        job_states = [(job, "UNKNOWN")]
+        pbar = MagicMock()
+        with (
+            patch("turboblast.blaster.subprocess.run") as mock_run,
+            patch("turboblast.blaster.time.sleep"),
+            caplog.at_level(logging.WARNING, logger="turboblast.blaster"),
+        ):
+            completed, failed = _force_finish_batch(
+                job_states, {"UNKNOWN": 1}, 1, pbar, 1, 1, "stalled"
+            )
+        # It did cancel the (blind) task...
+        assert mock_run.call_count == 1
+        assert mock_run.call_args[0][0] == ["scancel", "5000_1"]
+        # ...but re-queried it, so the re-read CANCELLED is verified (not unverified)
+        assert (completed, failed) == (0, 1)
+        assert "state_unverified" not in pbar.set_postfix.call_args[0][0]
+        assert "BLIND" in caplog.text
+
+    def test_blind_cancellation_still_down_is_unverified(self):
+        job = self._job("6000_1", "")  # re-query still unreadable -> {}
+        job_states = [(job, "UNKNOWN")]
+        pbar = MagicMock()
+        with (
+            patch("turboblast.blaster.subprocess.run"),
+            patch("turboblast.blaster.time.sleep"),
+        ):
+            completed, failed = _force_finish_batch(
+                job_states, {"UNKNOWN": 1}, 1, pbar, 1, 1, "stalled"
+            )
+        assert (completed, failed) == (0, 1)
+        postfix = pbar.set_postfix.call_args[0][0]
+        assert postfix["state_unverified"] == 1
+
+
+class TestSacctBypassLogFilter:
+    """submitit's repeated 'Bypassing sacct error' warnings are de-duplicated."""
+
+    def _record(self, msg: str, created: float) -> logging.LogRecord:
+        rec = logging.LogRecord(
+            name="submitit",
+            level=logging.WARNING,
+            pathname=__file__,
+            lineno=0,
+            msg=msg,
+            args=None,
+            exc_info=None,
+        )
+        rec.created = created
+        return rec
+
+    def test_rate_limits_identical_bypass_warnings(self):
+        filt = _SacctBypassLogFilter()
+        r1 = self._record("Call #1 - Bypassing sacct error boom", 1000.0)
+        r2 = self._record("Call #2 - Bypassing sacct error boom", 1030.0)
+        r3 = self._record("Call #3 - Bypassing sacct error boom", 1700.0)
+        assert filt.filter(r1) is True  # first passes
+        assert filt.filter(r2) is False  # within interval -> suppressed
+        assert filt.filter(r3) is True  # after interval -> passes again
+        # the suppressed count was folded into the third message
+        assert "1 identical warning(s) suppressed" in r3.msg
+
+    def test_passes_through_unrelated_messages(self):
+        filt = _SacctBypassLogFilter()
+        r = self._record("some normal log line", 0.0)
+        assert filt.filter(r) is True
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────

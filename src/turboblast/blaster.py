@@ -27,6 +27,47 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+
+class _SacctBypassLogFilter(logging.Filter):
+    """Rate-limit submitit's repeated ``Bypassing sacct error`` warnings.
+
+    While the Slurm accounting daemon (slurmdbd) is unreachable, submitit logs
+    one such warning per failed query. This filter lets at most one through per
+    ``_INTERVAL_S`` and notes how many identical warnings were suppressed.
+    """
+
+    _INTERVAL_S = 600.0
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._last_seen: float = 0.0
+        self._suppressed: int = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if "Bypassing sacct error" not in message:
+            return True
+        if record.created - self._last_seen < self._INTERVAL_S:
+            self._suppressed += 1
+            return False
+        self._last_seen = record.created
+        if self._suppressed and not record.args:
+            record.msg = (
+                f"{record.msg} [{self._suppressed} identical warning(s) "
+                "suppressed since the last one was shown]"
+            )
+        self._suppressed = 0
+        return True
+
+
+# submitit logs its own "Bypassing sacct error ..." warnings with TWO handlers
+# (stdout + stderr) and also propagates them to the root logger (a third copy,
+# in our format). Keep a single, rate-limited copy: stop the root propagation
+# (submitit keeps its own handlers) and install the filter above.
+_submitit_logger = logging.getLogger("submitit")
+_submitit_logger.propagate = False
+_submitit_logger.addFilter(_SacctBypassLogFilter())
+
 # ---------------------------------------------------------------------------
 # Slurm configuration
 # ---------------------------------------------------------------------------
@@ -93,6 +134,30 @@ def is_terminal_state(state: str) -> bool:
     ``sacct`` (e.g. ``"PENDING"``, ``"COMPLETED"``, ``"NODE_FAIL"``).
     """
     return state.upper() in TERMINAL_STATES
+
+
+def _safe_state(job: submitit.Job) -> str:
+    """Return the job's Slurm state, or ``"UNKNOWN"`` if it cannot be read.
+
+    ``submitit`` returns ``"UNKNOWN"`` when its ``sacct`` call fails (e.g. the
+    accounting daemon / DBD is unreachable) or the job has no state yet. A few
+    UNKNOWNs are normal per-task hiccups; a *whole batch* of them means the
+    state source itself is down (see the blind guard in ``ArrayBatch.poll``).
+    ``KeyboardInterrupt`` / ``SystemExit`` always propagate.
+    """
+    try:
+        return job.state
+    except (
+        submitit.core.utils.FailedJobError,
+        AttributeError,
+        RuntimeError,
+    ) as e:
+        # Ces exceptions sont attendues dans le contexte submitit/Slurm
+        logger.debug("Job state query failed: %s: %s", type(e).__name__, e)
+        return "UNKNOWN"
+    except OSError as e:
+        logger.warning("Unexpected error in job state polling: %s", e, exc_info=True)
+        return "UNKNOWN"
 
 
 def stuck_threshold_minutes(
@@ -306,6 +371,19 @@ def submit_chunk_with_retry(
 # ---------------------------------------------------------------------------
 
 
+def _query_state(job: submitit.Job) -> str:
+    """Force a fresh state read for one job; ``"UNKNOWN"`` if unreadable."""
+    try:
+        return job.get_info(mode="force").get("State") or "UNKNOWN"
+    except (
+        submitit.core.utils.FailedJobError,
+        AttributeError,
+        RuntimeError,
+        OSError,
+    ):
+        return "UNKNOWN"
+
+
 def _force_finish_batch(
     job_states: list[tuple[submitit.Job, str]],
     states: dict[str, int],
@@ -321,34 +399,67 @@ def _force_finish_batch(
     waiting any longer is not worth it. Each task is cancelled by its full
     per-task id (a submitit array job_id is "base_task"; cancelling the base id
     would scancel the whole array). Cancelled tasks count as failed.
+
+    Tasks whose state was already ``UNKNOWN`` when the backstop fired are
+    cancelled **blind** (their real state is unreadable — e.g. the accounting
+    daemon is down, issue #20). After the cancellation a fresh forced state
+    read is attempted for every remaining task; whatever is still unreadable is
+    reported as ``state_unverified`` rather than silently counted.
     """
     remaining = [j for j, s in job_states if not is_terminal_state(s)]
+    blind_remaining = [j for j, s in job_states if s == "UNKNOWN"]
     job_ids = sorted(j.job_id for j in remaining)
     logger.warning(
-        "Batch %d/%d: %s — cancelling %d remaining task(s): %s",
+        "Batch %d/%d: %s — cancelling %d remaining task(s)%s: %s",
         chunk_idx,
         total_chunks,
         reason,
         len(remaining),
+        (
+            f" (BLIND: {len(blind_remaining)} task(s) had UNKNOWN state — they "
+            "may not be stuck at all)"
+            if blind_remaining
+            else ""
+        ),
         job_ids,
     )
     if job_ids:
         subprocess.run(["scancel", *job_ids], check=False)
     # Wait one cycle for Slurm to process the cancellations.
     time.sleep(BATCH_POLL_INTERVAL)
-    completed = states.get("COMPLETED", 0)
-    failed = total - completed
-    pbar.set_postfix(
-        {"completed": completed, "failed": failed, "cancelled": len(remaining)},
-        refresh=True,
+    # Re-query the still-non-terminal tasks so final counts use verified states
+    # where the state source has come back in the meantime.
+    verified: dict[submitit.Job, str] = {
+        j: _query_state(j) for j, s in job_states if not is_terminal_state(s)
+    }
+    unverified = sum(1 for s in verified.values() if s == "UNKNOWN")
+    # Previously-terminal COMPLETED jobs + any still-running job that reached
+    # COMPLETED in the meantime.
+    completed = states.get("COMPLETED", 0) + sum(
+        1 for s in verified.values() if s == "COMPLETED"
     )
+    failed = total - completed
+    postfix: dict[str, object] = {
+        "completed": completed,
+        "failed": failed,
+        "cancelled": len(remaining),
+    }
+    if unverified:
+        postfix["state_unverified"] = unverified
+    pbar.set_postfix(postfix, refresh=True)
     logger.warning(
-        "Batch %d/%d force-finished — completed=%d  failed=%d  cancelled=%d",
+        "Batch %d/%d force-finished — completed=%d  failed=%d  cancelled=%d%s",
         chunk_idx,
         total_chunks,
         completed,
         failed,
         len(remaining),
+        (
+            f"  state_unverified={unverified} (state source still down — check "
+            "with 'sacct -j <array_id>' later)"
+            if unverified
+            else ""
+        ),
     )
     return completed, failed
 
@@ -381,7 +492,15 @@ class ArrayBatch:
       This is what catches a single task stuck in ``PENDING``/``HELD`` while the
       other 999 have already finished.
     * **Batch wall-time cap** (``batch_wall_timeout_min``) — a hard maximum wall
-      time per batch, so no batch can stall the chain for arbitrarily long.
+    time per batch, so no batch can stall the chain for arbitrarily long.
+    * **Blind guard** (``blind_timeout_min``) — when *every* task reports
+      ``UNKNOWN`` in a poll cycle, the Slurm state source itself (sacct/DBD) is
+      unreachable and the states are meaningless (issue #20): the stall and
+      wall clocks are paused (re-based) for as long as that lasts, so a
+      transient outage can never blind-cancel a healthy batch. If the source
+      stays down for ``blind_timeout_min`` minutes, the batch is given up
+      **without cancelling** and its unreadable tasks are reported as failed
+      but flagged ``state_unverified``.
     """
 
     def __init__(
@@ -394,6 +513,7 @@ class ArrayBatch:
         task_stuck_min: float = 15.0,
         batch_wall_timeout_min: float | None = None,
         task_timeout_min: int = 20,
+        blind_timeout_min: float | None = None,
         position: int = 0,
         leave: bool = True,
     ) -> None:
@@ -418,6 +538,23 @@ class ArrayBatch:
         # measured from its RUNNING start, not from when it first went non-terminal.
         self.state_since: dict[submitit.Job, tuple[str, float]] = {}
         self.prev_terminal = 0
+        # Blind-state (state source unreachable) tracking: when the whole batch
+        # reports UNKNOWN, the backstop clocks are paused (last-progress and
+        # batch-start are re-based each cycle so they don't accumulate while
+        # blind) and the blind clock below bounds how long we wait for the
+        # state source to recover before giving up *without* cancelling.
+        self._blind = False
+        self._blind_since: float | None = None
+        # Max minutes the state source (sacct/slurmdbd) may stay unreachable
+        # before the batch is given up without cancelling (see poll()).
+        blind_cap = blind_timeout_min
+        if blind_cap is None or blind_cap <= 0:
+            blind_cap = (
+                2.0 * stall_timeout_min
+                if stall_timeout_min is not None and stall_timeout_min > 0
+                else 120.0
+            )
+        self.blind_timeout_min = blind_cap
         self.pbar = tqdm(
             total=self.total,
             desc=f"Batch {chunk_idx}/{total_chunks}",
@@ -445,6 +582,39 @@ class ArrayBatch:
         self.pbar.position = position
         self.pbar.refresh()
 
+    def _give_up_blind(self, states: dict[str, int], now: float) -> None:
+        """Give up on a batch whose state source never came back.
+
+        Unlike the backstops, nothing is cancelled: the tasks may be running
+        fine and we simply cannot verify it. The unreadable tasks are reported
+        as failed (so ``--fail-fast`` still reacts) but the log and progress
+        bar make it explicit that their state is unverified.
+        """
+        blind_min = (now - (self._blind_since or now)) / 60.0
+        self.completed = states.get("COMPLETED", 0)
+        self.failed = self.total - self.completed
+        self.pbar.set_postfix(
+            {
+                "completed": self.completed,
+                "failed": self.failed,
+                "state_unverified": self.failed,
+            },
+            refresh=True,
+        )
+        logger.error(
+            "Batch %d/%d: state source (sacct/slurmdbd) unreachable for %.0f min "
+            "(blind cap %.0f min). Giving up WITHOUT cancelling — completed=%d, "
+            "failed=%d but state_unverified: check the array with "
+            "'sacct -j <array_id>' once accounting is back.",
+            self.chunk_idx,
+            self.total_chunks,
+            blind_min,
+            self.blind_timeout_min,
+            self.completed,
+            self.failed,
+        )
+        self._finish()
+
     def _finish(self) -> None:
         """Mark the batch done and finalize its progress bar."""
         self.done = True
@@ -454,33 +624,49 @@ class ArrayBatch:
     def poll(self, now: float) -> bool:
         """Advance one poll cycle; return True if the batch is now finished."""
         # ── Collect per-task states via submitit (wraps squeue/sacct) ──
-        job_states: list[tuple[submitit.Job, str]] = []
+        job_states = [(job, _safe_state(job)) for job in self.jobs]
         states: dict[str, int] = {}
-        for job in self.jobs:
-            try:
-                state = job.state
-            except (
-                submitit.core.utils.FailedJobError,
-                AttributeError,
-                RuntimeError,
-            ) as e:
-                # Ces exceptions sont attendues dans le contexte submitit/Slurm
-                logger.debug("Job state query failed: %s: %s", type(e).__name__, e)
-                state = "UNKNOWN"
-            except (KeyboardInterrupt, SystemExit, OSError) as e:
-                # Attraper les autres exceptions mais avec log de warning
-                # et propagation des exceptions système critiques
-                if isinstance(e, (KeyboardInterrupt, SystemExit)):
-                    raise
-                logger.warning(
-                    "Unexpected error in job state polling: %s", e, exc_info=True
-                )
-                state = "UNKNOWN"
-            job_states.append((job, state))
+        for _, state in job_states:
             states[state] = states.get(state, 0) + 1
 
         # ── Count terminal tasks ──
         n_terminal = sum(1 for _, s in job_states if is_terminal_state(s))
+
+        # ── Blind guard: is the state source itself unreachable? ──
+        # When *every* task reads UNKNOWN, submitit's single sacct query failed
+        # (e.g. slurmdbd/DBD outage). The states are worthless: the backstop
+        # clocks must not advance on them (a healthy batch would otherwise be
+        # blind-cancelled). We pause by re-basing the clocks each blind cycle
+        # and bound the wait with the blind clock below.
+        blind = 0 < self.total == states.get("UNKNOWN", 0)
+        if blind:
+            self._blind_since = now if self._blind_since is None else self._blind_since
+            self.last_progress_time = now
+            self.batch_start = now
+            if not self._blind:
+                self._blind = True
+                logger.warning(
+                    "Batch %d/%d: all %d task(s) report UNKNOWN state — the Slurm "
+                    "state source (sacct/slurmdbd) appears unreachable. Backstops "
+                    "paused; will give up after %.0f min of blindness WITHOUT "
+                    "cancelling (check slurmdbd on the cluster).",
+                    self.chunk_idx,
+                    self.total_chunks,
+                    self.total,
+                    self.blind_timeout_min,
+                )
+            if (now - self._blind_since) / 60.0 >= self.blind_timeout_min:
+                self._give_up_blind(states, now)
+                return True
+        elif self._blind:
+            self._blind = False
+            self._blind_since = None
+            logger.info(
+                "Batch %d/%d: Slurm state source recovered after blindness — "
+                "resuming backstops.",
+                self.chunk_idx,
+                self.total_chunks,
+            )
 
         # ── Per-task stuck detection ──
         # Track how long each non-terminal task has been in its *current* state
@@ -603,6 +789,11 @@ class ArrayBatch:
             postfix_parts["wall"] = (
                 f"{int(wall_min)}/{int(self.batch_wall_timeout_min)}min"
             )
+        if self._blind:
+            postfix_parts["blind"] = (
+                f"{int((now - (self._blind_since or now)) / 60.0)}/"
+                f"{int(self.blind_timeout_min)}min"
+            )
         self.pbar.set_postfix(postfix_parts)
 
         parts = [f"{s}={n}" for s, n in sorted(states.items())]
@@ -645,6 +836,7 @@ def wait_for_batch_completion(
     task_stuck_min: float = 15.0,
     batch_wall_timeout_min: float | None = None,
     task_timeout_min: int = 20,
+    blind_timeout_min: float | None = None,
 ) -> tuple[int, int]:
     """Blocks until every job in a batch reaches a terminal Slurm state.
 
@@ -664,6 +856,9 @@ def wait_for_batch_completion(
         task_stuck_min (float): Per-task stuck timeout for hold/transient states.
         batch_wall_timeout_min (float | None): Hard cap on batch wall time.
         task_timeout_min (int): The ``--timeout-min`` value (bounds RUNNING tasks).
+        blind_timeout_min (float | None): Max minutes to wait for the Slurm
+            state source when the whole batch reads UNKNOWN. ``None`` = auto
+            (2x the no-progress backstop, or 120 min if it is disabled).
 
     Returns:
         tuple[int, int]: ``(completed, failed)`` task counts.
@@ -676,6 +871,7 @@ def wait_for_batch_completion(
         task_stuck_min=task_stuck_min,
         batch_wall_timeout_min=batch_wall_timeout_min,
         task_timeout_min=task_timeout_min,
+        blind_timeout_min=blind_timeout_min,
     )
     while True:
         time.sleep(BATCH_POLL_INTERVAL)
@@ -892,9 +1088,18 @@ def main(args: argparse.Namespace) -> None:
     if stall_timeout_min is None:
         stall_timeout_min = args.timeout_min + NO_PROGRESS_GRACE_MIN
     task_stuck_min = args.task_stuck_min
+    # How long the whole batch may stay "blind" (state source unreachable, all
+    # states UNKNOWN) before it is given up *without* cancelling. 0 = disabled
+    # (wait forever). Default: 2x the no-progress backstop.
+    blind_timeout_min = (
+        2.0 * stall_timeout_min
+        if stall_timeout_min is not None and stall_timeout_min > 0
+        else 120.0
+    )
     logger.info(
         "Batch protection — no-progress backstop: %.0f min | per-task stuck: %.0f "
-        "min | wall cap: %s | task timeout: %d min",
+        "min | wall cap: %s | task timeout: %d min | blind (state source down): "
+        "%.0f min",
         stall_timeout_min,
         task_stuck_min,
         (
@@ -903,6 +1108,7 @@ def main(args: argparse.Namespace) -> None:
             else f"{args.batch_wall_timeout_min:.0f} min"
         ),
         args.timeout_min,
+        blind_timeout_min,
     )
 
     # Guard against a non-positive pipeline depth (0 would make the fill loop never
@@ -964,6 +1170,7 @@ def main(args: argparse.Namespace) -> None:
                 task_stuck_min=task_stuck_min,
                 batch_wall_timeout_min=batch_wall,
                 task_timeout_min=args.timeout_min,
+                blind_timeout_min=blind_timeout_min,
             )
         )
         return True
