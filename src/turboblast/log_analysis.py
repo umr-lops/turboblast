@@ -4,13 +4,36 @@ Python port of the former ``submitit_logs_analysis.sh`` helper. Given the
 directory that ``turboblaster`` writes its submitit logs into, it counts the
 tasks, how many succeeded, and breaks the failures down by likely cause
 (permission, OOM/killed, Python exceptions, socket/Slurm, apptainer).
+
+All messages are emitted through the ``logging`` module, and the scan runs
+under a live ``tqdm`` progress bar whose postfix shows the running count of
+each failure category in real time.
 """
 
 import argparse
+import logging
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
+
+# This format matches standard logging practices: [Date Time] [LEVEL] Message
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+_LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _configure_logger() -> None:
+    """Attach a stdout handler to this module's logger (idempotent)."""
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATEFMT))
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
 
 # (label, compiled pattern, file suffixes to scan) — order matches the output.
 _CATEGORIES: tuple[tuple[str, re.Pattern[str], tuple[str, ...]], ...] = (
@@ -42,6 +65,14 @@ _CATEGORIES: tuple[tuple[str, re.Pattern[str], tuple[str, ...]], ...] = (
         (".out", ".err"),
     ),
 )
+# Short labels for the live progress bar postfix (kept narrow on purpose).
+_CATEGORY_SHORT: dict[str, str] = {
+    "Permission Issues": "perm",
+    "Killed / Out of Mem": "oom",
+    "Python Exceptions": "py-exc",
+    "Socket/Slurm Errors": "sock",
+    "Apptainer Errors": "appt",
+}
 _SUCCESS = re.compile(r"completed successfully|success", re.IGNORECASE)
 
 
@@ -70,28 +101,45 @@ def _pct(count: int, total: int) -> str:
     return f"{(count / total) * 100:.1f}"
 
 
+def _postfix(categories: dict[str, int]) -> dict[str, int]:
+    """Map full category labels to their short progress-bar names."""
+    return {_CATEGORY_SHORT[label]: count for label, count in categories.items()}
+
+
 def analyze_dir(log_dir: Path) -> LogReport:
-    """Scan *log_dir* and return aggregated success/failure counts."""
+    """Scan *log_dir* and return aggregated success/failure counts.
+
+    Each log file is read once; the tqdm bar in the postfix shows, in real
+    time, how many files matched each failure category so far.
+    """
     out_files = sorted(log_dir.glob("*.out"))
     err_files = sorted(log_dir.glob("*.err"))
     files = [*out_files, *err_files]
-    contents = {path: _read(path) for path in files}
 
-    total = len(out_files)
-    success = sum(1 for path in out_files if _SUCCESS.search(contents[path]))
-
-    categories: dict[str, int] = {}
-    for label, pattern, suffixes in _CATEGORIES:
-        categories[label] = sum(
-            1
-            for path in files
-            if path.suffix in suffixes and pattern.search(contents[path])
-        )
+    success = 0
+    categories = {label: 0 for label, _, _ in _CATEGORIES}
+    with tqdm(
+        files,
+        desc="Scanning logs",
+        unit="file",
+        dynamic_ncols=True,
+        leave=False,
+        file=sys.stdout,
+    ) as pbar:
+        pbar.set_postfix(_postfix(categories))
+        for path in pbar:
+            content = _read(path)
+            if path.suffix == ".out" and _SUCCESS.search(content):
+                success += 1
+            for label, pattern, suffixes in _CATEGORIES:
+                if path.suffix in suffixes and pattern.search(content):
+                    categories[label] += 1
+            pbar.set_postfix(_postfix(categories))
 
     return LogReport(
-        total=total,
+        total=len(out_files),
         success=success,
-        failures=total - success,
+        failures=len(out_files) - success,
         categories=categories,
     )
 
@@ -139,12 +187,14 @@ def parser_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def entrypoint() -> None:
     """Console entry point for the ``slurm-logs`` command."""
+    _configure_logger()
     args = parser_args()
     log_dir = Path(args.log_dir)
     if not log_dir.is_dir():
-        sys.stderr.write(f"Error: Directory {log_dir} does not exist.\n")
+        logger.error("Directory %s does not exist.", log_dir)
         raise SystemExit(1)
-    sys.stdout.write(format_report(analyze_dir(log_dir), log_dir) + "\n")
+    report = analyze_dir(log_dir)
+    logger.info(format_report(report, log_dir))
 
 
 if __name__ == "__main__":
