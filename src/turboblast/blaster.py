@@ -1005,7 +1005,7 @@ def parser_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def main(args: argparse.Namespace) -> None:
+def main(args: argparse.Namespace) -> int:
     """Configures and submits job array chunks to the Slurm cluster (pipelined).
 
     Strategy:
@@ -1025,8 +1025,20 @@ def main(args: argparse.Namespace) -> None:
     ``--max-arrays-inflight x --slurm-array-parallelism``.  Each array keeps the
     Phase-1 stuck-task protection (see :class:`ArrayBatch`).
 
-    Each submission is retried up to ``SUBMIT_MAX_RETRIES`` times with linear
-    backoff to handle transient sbatch failures.
+    Submission failures (e.g. the Slurm controller briefly unreachable, issue
+    #24) do NOT kill the run: each submission is retried up to
+    ``SUBMIT_MAX_RETRIES`` times with linear backoff, and if that is exhausted
+    the chunk is left pending and retried again on every subsequent poll
+    cycle (``BATCH_POLL_INTERVAL`` seconds apart) until the controller is back.
+    Only when the controller has stayed unreachable for ``blind_timeout_min``
+    minutes (the same cap used by :class:`ArrayBatch`'s blind guard) AND no
+    in-flight array is left to monitor does this function give up: it returns
+    ``1`` (a clean exit, nothing is cancelled) after logging which tasks were
+    never submitted.
+
+    Returns:
+        int: ``0`` on success, ``1`` if the run was given up because the Slurm
+        controller stayed unreachable for the blind cap.
 
     Args:
         args (argparse.Namespace): Parsed CLI arguments (paths + Slurm config).
@@ -1061,7 +1073,7 @@ def main(args: argparse.Namespace) -> None:
 
     if not array_inputs:
         logger.error("Input listing file is empty. Aborting submission.")
-        return
+        return 0
 
     total_chunks = (len(array_inputs) + CHUNK_SIZE - 1) // CHUNK_SIZE
     logger.info("Total tasks to submit: %d", len(array_inputs))
@@ -1126,18 +1138,27 @@ def main(args: argparse.Namespace) -> None:
     global_failed = 0
     # --fail-fast: once set, no more arrays are submitted; in-flight ones drain.
     fail_fast_stop = False
+    # When a submission is impossible (Slurm controller unreachable, issue
+    # #24): the monotonic time the outage started, or None when submissions
+    # work. Bounds how long the run keeps retrying an unsubmittable chunk with
+    # nothing in flight to monitor (the "blind" state of the submission side).
+    submit_unavailable_since: float | None = None
 
     def _submit_next() -> bool:
-        """Submit the next pending chunk (if any) and add it to in_flight.
+        """Try to submit the next pending chunk (if any) and add it to in_flight.
 
-        Returns False if there are no more chunks to submit.
+        Returns False if there are no more chunks to submit, or if the
+        submission failed: in that case the chunk is left pending
+        (``next_chunk_idx`` is NOT advanced) so the poll loop retries it on a
+        later cycle. A transient Slurm controller outage (issue #24) must
+        therefore neither kill the run nor lose a chunk's tasks.
         """
         nonlocal next_chunk_idx
+        nonlocal submit_unavailable_since
         if next_chunk_idx >= len(chunks):
             return False
         chunk_idx = next_chunk_idx
         chunk = chunks[next_chunk_idx]
-        next_chunk_idx += 1
         logger.debug(
             "=== Submitting batch %d/%d — tasks %d to %d (%d tasks) ===",
             chunk_idx + 1,
@@ -1146,9 +1167,33 @@ def main(args: argparse.Namespace) -> None:
             chunk_idx * CHUNK_SIZE + len(chunk) - 1,
             len(chunk),
         )
-        jobs = submit_chunk_with_retry(
-            executor, process_func, chunk, chunk_idx + 1, total_chunks
-        )
+        try:
+            jobs = submit_chunk_with_retry(
+                executor, process_func, chunk, chunk_idx + 1, total_chunks
+            )
+        except ChunkSubmissionError:
+            # All SUBMIT_MAX_RETRIES attempts failed (e.g. "Unable to contact
+            # slurm controller"): stay up, keep monitoring the in-flight
+            # arrays, and retry this same chunk on the next poll cycle.
+            if submit_unavailable_since is None:
+                submit_unavailable_since = time.monotonic()
+            # logger.error (not exception): the failure is expected and already
+            # logged by submit_chunk_with_retry; a full traceback every poll
+            # cycle during an outage would be pure noise.
+            logger.error(  # noqa: TRY400
+                "Chunk %d/%d could not be submitted (Slurm controller "
+                "unreachable?). Keeping the run alive: the chunk stays pending "
+                "and will be retried on the next poll cycle (%d s); in-flight "
+                "arrays keep being monitored.",
+                chunk_idx + 1,
+                total_chunks,
+                BATCH_POLL_INTERVAL,
+            )
+            return False
+        # Successful submission: reset the outage clock and advance only now,
+        # so a failed chunk is never skipped.
+        submit_unavailable_since = None
+        next_chunk_idx += 1
         # Per-chunk wall cap. A RUNNING task can't exceed --timeout-min, so the
         # theoretical max healthy duration is `waves * timeout_min` where
         # waves = ceil(chunk_size / parallelism). We use 2x that as a loose
@@ -1229,6 +1274,8 @@ def main(args: argparse.Namespace) -> None:
                     )
 
             # Refill the pipeline while there are free slots and pending chunks.
+            # (_submit_next() returns False on submission failure, so the loop
+            # cannot spin while the controller is down.)
             if not fail_fast_stop:
                 while (
                     len(in_flight) < max_inflight
@@ -1236,6 +1283,31 @@ def main(args: argparse.Namespace) -> None:
                     and _submit_next()
                 ):
                     pass
+
+            # Give up — cleanly — when the Slurm controller is unreachable,
+            # there is nothing left in flight to monitor, and the outage has
+            # lasted longer than the blind cap (issue #24): after this point
+            # there is nothing to do but wait for a human to restart the run.
+            # Returning 1 (instead of letting ChunkSubmissionError escape)
+            # keeps the exit clean and bounded.
+            if submit_unavailable_since is not None and not in_flight:
+                outage_min = (time.monotonic() - submit_unavailable_since) / 60.0
+                if outage_min >= blind_timeout_min:
+                    pending_tasks = sum(len(c) for c in chunks[next_chunk_idx:])
+                    logger.error(
+                        "Giving up: the Slurm controller has been unreachable "
+                        "for %.0f min (blind cap %.0f min) and no array is "
+                        "left in flight to monitor. %d task(s) were never "
+                        "submitted; completed=%d  failed=%d so far. Re-run "
+                        "turboblaster with the same --listing-input once the "
+                        "controller is back.",
+                        outage_min,
+                        blind_timeout_min,
+                        pending_tasks,
+                        global_completed,
+                        global_failed,
+                    )
+                    return 1
 
             # Reposition bars after removals/additions.
             for i, b in enumerate(in_flight):
@@ -1254,6 +1326,7 @@ def main(args: argparse.Namespace) -> None:
         "Task logs are in: %s/<ARRAY_ID>_<TASK_ID>_0_log.out",
         output_dir_with_date,
     )
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1264,10 +1337,12 @@ def main(args: argparse.Namespace) -> None:
 def entrypoint() -> None:
     """Script entry point.
 
-    Parses CLI arguments and delegates to :func:`main`.
+    Parses CLI arguments and delegates to :func:`main`. Exits with a non-zero
+    status if the run was given up (e.g. the Slurm controller stayed
+    unreachable, issue #24), and with ``0`` otherwise.
     """
     args = parser_args()
-    main(args)
+    sys.exit(main(args))
 
 
 if __name__ == "__main__":

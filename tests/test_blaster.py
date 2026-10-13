@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import logging
 import subprocess
 from collections.abc import Callable
@@ -13,6 +14,7 @@ from turboblast.blaster import (
     _force_finish_batch,
     _query_state,
     _SacctBypassLogFilter,
+    entrypoint,
     main,
     parse_memory_to_gb,
     parser_args,
@@ -1011,3 +1013,167 @@ class TestMain:
         subdirs = list(output_dir.glob("*"))
         assert len(subdirs) == 1
         assert subdirs[0].name.startswith("20")
+
+    # ── Slurm controller outage on submission (issue #24) ────────────────────
+
+    def _outage_error(self) -> RuntimeError:
+        return RuntimeError(
+            "sbatch: error: Batch job submission failed: "
+            "Unable to contact slurm controller (connect failure)"
+        )
+
+    def _run_with_map_side_effect(
+        self,
+        tmp_path: Path,
+        side_effect: list[object] | Callable[..., object],
+        monotonic_step_min: float | None = None,
+    ) -> tuple[MagicMock, int]:
+        """Run main() with a scripted map_array; return (executor, exit code)."""
+        ex = MagicMock()
+        ex.map_array.side_effect = side_effect
+        patches = [
+            patch(
+                "turboblast.blaster.ArrayBatch",
+                MagicMock(side_effect=self._instant_batch()),
+            ),
+            patch("turboblast.blaster.submitit.AutoExecutor", return_value=ex),
+            patch("turboblast.blaster.time.sleep"),
+        ]
+        if monotonic_step_min is not None:
+            clock = [0.0]
+
+            def _fast_monotonic() -> float:
+                clock[0] += monotonic_step_min * 60
+                return clock[0]
+
+            patches.append(
+                patch(
+                    "turboblast.blaster.time.monotonic",
+                    MagicMock(side_effect=_fast_monotonic),
+                )
+            )
+        args = self._make_args(tmp_path, lines=[f"--input {i}.nc" for i in range(2500)])
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            result = main(args)
+        return ex, result
+
+    def test_transient_submission_outage_retries_and_completes(self, tmp_path):
+        """Issue #24: the controller drops for the length of one submission
+        (both retry attempts of chunk 2 fail); the run must NOT crash — the
+        chunk stays pending, is resubmitted on the next cycle, and the run
+        finishes all 3 chunks with exit code 0."""
+        ok = [MagicMock()]
+        ex, code = self._run_with_map_side_effect(
+            tmp_path,
+            side_effect=[ok, self._outage_error(), self._outage_error(), ok, ok],
+        )
+        assert code == 0
+        # 2500 tasks -> chunks of 1000/1000/500, all eventually submitted.
+        assert ex.map_array.call_count == 5
+        assert [len(c[0][1]) for c in ex.map_array.call_args_list] == [
+            1000,
+            1000,
+            1000,
+            1000,
+            500,
+        ]
+
+    def test_permanent_submission_outage_gives_up_cleanly(self, tmp_path):
+        """Issue #24: the controller never comes back. main() must not let the
+        ChunkSubmissionError escape (that killed the process, segfault at
+        exit): it gives up once the blind cap elapses with nothing in flight,
+        returning 1 (clean non-zero exit, nothing cancelled)."""
+
+        def _always_down(_func, _chunk):
+            raise self._outage_error()
+
+        ex, code = self._run_with_map_side_effect(
+            tmp_path,
+            side_effect=_always_down,
+            monotonic_step_min=61,  # fast-forward past the 120-min blind cap
+        )
+        assert code == 1
+        # No array was ever submitted.
+        assert ex.map_array.call_count >= 2
+
+    def test_submission_outage_with_inflight_batch_does_not_give_up(self, tmp_path):
+        """While the controller is down, an array still in flight keeps the run
+        alive past the blind cap (there is still something to monitor): main()
+        must NOT give up (return 1) — it keeps polling the in-flight array and
+        only submits the pending chunk once the controller recovers. The fast
+        monotonic clock inflates the outage past the blind cap to exercise the
+        give-up condition while ``in_flight`` is non-empty."""
+        args = self._make_args(tmp_path, lines=[f"--input {i}.nc" for i in range(2500)])
+        args.max_arrays_inflight = 2
+
+        def _batch_factory(_jobs, chunk_idx, _total_chunks, **_kw) -> MagicMock:
+            b = MagicMock()
+            b.completed = 1000
+            b.failed = 0
+            b.done = False
+            polls = [0]
+
+            def _poll(_now: float) -> bool:
+                polls[0] += 1
+                # Chunk 1 stays in flight a few cycles; later chunks drain fast.
+                if chunk_idx > 1 or polls[0] >= 4:
+                    b.done = True
+                return b.done
+
+            b.poll.side_effect = _poll
+            return b
+
+        ex = MagicMock()
+        ok = [MagicMock()]
+
+        def _map(_func, _chunk):
+            # Chunk 1 submits fine; chunk 2's first two attempts fail
+            # (controller down); the third attempt (next cycle) succeeds.
+            if ex.map_array.call_count in (2, 3):
+                raise self._outage_error()
+            return ok
+
+        ex.map_array.side_effect = _map
+        clock = [0.0]
+
+        def _fast_monotonic() -> float:
+            clock[0] += 61 * 60  # every call jumps well past the blind cap
+            return clock[0]
+
+        with (
+            patch("turboblast.blaster.ArrayBatch", side_effect=_batch_factory),
+            patch("turboblast.blaster.submitit.AutoExecutor", return_value=ex),
+            patch("turboblast.blaster.time.sleep"),
+            patch("turboblast.blaster.time.monotonic", _fast_monotonic),
+        ):
+            code = main(args)
+        assert code == 0
+        # All 3 chunks were submitted; the pending one was not skipped.
+        assert len(ex.map_array.call_args_list) == 5
+
+
+class TestEntrypoint:
+    """entrypoint() must propagate main()'s exit code via sys.exit (issue #24):
+    0 on success, 1 when the run is given up (e.g. controller unreachable)."""
+
+    def test_exit_code_zero_on_success(self):
+        with (
+            patch("turboblast.blaster.parser_args") as mock_parse,
+            patch("turboblast.blaster.main", return_value=0) as mock_main,
+            patch("sys.exit") as mock_exit,
+        ):
+            entrypoint()
+        mock_main.assert_called_once_with(mock_parse.return_value)
+        mock_exit.assert_called_once_with(0)
+
+    def test_exit_code_one_on_give_up(self):
+        with (
+            patch("turboblast.blaster.parser_args") as mock_parse,
+            patch("turboblast.blaster.main", return_value=1) as mock_main,
+            patch("sys.exit") as mock_exit,
+        ):
+            entrypoint()
+        mock_main.assert_called_once_with(mock_parse.return_value)
+        mock_exit.assert_called_once_with(1)
