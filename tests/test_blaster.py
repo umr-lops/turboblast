@@ -14,6 +14,7 @@ from turboblast.blaster import (
     _force_finish_batch,
     _query_state,
     _SacctBypassLogFilter,
+    entrypoint,
     main,
     parse_memory_to_gb,
     parser_args,
@@ -1151,3 +1152,28 @@ class TestMain:
         assert code == 0
         # All 3 chunks were submitted; the pending one was not skipped.
         assert len(ex.map_array.call_args_list) == 5
+
+
+class TestEntrypoint:
+    """entrypoint() must propagate main()'s exit code via sys.exit (issue #24):
+    0 on success, 1 when the run is given up (e.g. controller unreachable)."""
+
+    def test_exit_code_zero_on_success(self):
+        with (
+            patch("turboblast.blaster.parser_args") as mock_parse,
+            patch("turboblast.blaster.main", return_value=0) as mock_main,
+            patch("sys.exit") as mock_exit,
+        ):
+            entrypoint()
+        mock_main.assert_called_once_with(mock_parse.return_value)
+        mock_exit.assert_called_once_with(0)
+
+    def test_exit_code_one_on_give_up(self):
+        with (
+            patch("turboblast.blaster.parser_args") as mock_parse,
+            patch("turboblast.blaster.main", return_value=1) as mock_main,
+            patch("sys.exit") as mock_exit,
+        ):
+            entrypoint()
+        mock_main.assert_called_once_with(mock_parse.return_value)
+        mock_exit.assert_called_once_with(1)
